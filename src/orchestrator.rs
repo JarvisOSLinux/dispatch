@@ -50,6 +50,12 @@ pub struct Orchestrator {
     current_session_id: Option<String>,
 }
 
+impl Default for Orchestrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Orchestrator {
     pub fn new() -> Self {
         let (reminder_tx, reminder_rx) = mpsc::channel(REMINDER_CHANNEL_SIZE);
