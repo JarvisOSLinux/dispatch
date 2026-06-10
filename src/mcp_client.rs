@@ -23,11 +23,7 @@ impl DmcpClient {
 
     /// Call a tool on an MCP server via `dmcp call <server> <tool> --args <json>`.
     /// Returns the stdout output as a string.
-    pub async fn call_tool(
-        server: &str,
-        tool: &str,
-        params: &serde_json::Value,
-    ) -> Result<String> {
+    pub async fn call_tool(server: &str, tool: &str, params: &serde_json::Value) -> Result<String> {
         debug!(server, tool, "calling dmcp tool");
         let mut cmd = Command::new("dmcp");
         cmd.arg("call").arg(server).arg(tool);
@@ -62,19 +58,19 @@ impl DmcpClient {
             cmd.arg("-k").arg(kw);
         }
 
-        let output = cmd.output().await.map_err(|e| {
-            DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e))
-        })?;
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e)))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if output.status.success() {
-            serde_json::from_str(stdout.trim())
-                .map_err(|e| DispatchError::DmcpError(format!("invalid JSON from dmcp browse: {}", e)))
+            serde_json::from_str(stdout.trim()).map_err(|e| {
+                DispatchError::DmcpError(format!("invalid JSON from dmcp browse: {}", e))
+            })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(DispatchError::DmcpError(
-                stderr.trim().to_string(),
-            ))
+            Err(DispatchError::DmcpError(stderr.trim().to_string()))
         }
     }
 
@@ -101,8 +97,9 @@ impl DmcpClient {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if output.status.success() {
-            serde_json::from_str(stdout.trim())
-                .map_err(|e| DispatchError::DmcpError(format!("invalid JSON from dmcp browse: {}", e)))
+            serde_json::from_str(stdout.trim()).map_err(|e| {
+                DispatchError::DmcpError(format!("invalid JSON from dmcp browse: {}", e))
+            })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(DispatchError::DmcpError(stderr.trim().to_string()))
@@ -132,8 +129,9 @@ impl DmcpClient {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if output.status.success() {
-            serde_json::from_str(stdout.trim())
-                .map_err(|e| DispatchError::DmcpError(format!("invalid JSON from dmcp browse: {}", e)))
+            serde_json::from_str(stdout.trim()).map_err(|e| {
+                DispatchError::DmcpError(format!("invalid JSON from dmcp browse: {}", e))
+            })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(DispatchError::DmcpError(stderr.trim().to_string()))
@@ -150,9 +148,10 @@ impl DmcpClient {
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.trim().parse::<u64>().map_err(|e| {
-                DispatchError::DmcpError(format!("invalid count from dmcp: {}", e))
-            })
+            stdout
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| DispatchError::DmcpError(format!("invalid count from dmcp: {}", e)))
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(DispatchError::DmcpError(stderr.trim().to_string()))
@@ -169,8 +168,9 @@ impl DmcpClient {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if output.status.success() {
-            serde_json::from_str(stdout.trim())
-                .map_err(|e| DispatchError::DmcpError(format!("invalid JSON from dmcp embedding-spec: {}", e)))
+            serde_json::from_str(stdout.trim()).map_err(|e| {
+                DispatchError::DmcpError(format!("invalid JSON from dmcp embedding-spec: {}", e))
+            })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(DispatchError::DmcpError(stderr.trim().to_string()))
@@ -222,19 +222,16 @@ impl DmcpClient {
             .arg("--json")
             .output()
             .await
-            .map_err(|e| {
-                DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e))
-            })?;
+            .map_err(|e| DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e)))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         if output.status.success() {
-            serde_json::from_str(stdout.trim())
-                .map_err(|e| DispatchError::DmcpError(format!("invalid JSON from dmcp tools: {}", e)))
+            serde_json::from_str(stdout.trim()).map_err(|e| {
+                DispatchError::DmcpError(format!("invalid JSON from dmcp tools: {}", e))
+            })
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(DispatchError::DmcpError(
-                stderr.trim().to_string(),
-            ))
+            Err(DispatchError::DmcpError(stderr.trim().to_string()))
         }
     }
 }

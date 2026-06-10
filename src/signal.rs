@@ -138,7 +138,9 @@ impl SignalWindow {
     /// Used for session-scoped signal windows so historical PIDs from
     /// earlier goals never appear in the LLM's context.
     pub fn format_window_for_pids(&self, count: usize, pids: &HashSet<u64>) -> String {
-        let filtered: Vec<&SignalEntry> = self.entries.iter()
+        let filtered: Vec<&SignalEntry> = self
+            .entries
+            .iter()
             .filter(|e| pids.contains(&e.pid))
             .collect();
         if filtered.is_empty() {
@@ -215,18 +217,29 @@ mod tests {
 
     #[test]
     fn nonce_stored_on_entry_but_not_in_display() {
-        let entry =
-            SignalEntry::new(7, SignalKind::Exit, "[hash=a3f2c1] 200").with_nonce("a3f2c1");
+        let entry = SignalEntry::new(7, SignalKind::Exit, "[hash=a3f2c1] 200").with_nonce("a3f2c1");
         assert_eq!(entry.nonce.as_deref(), Some("a3f2c1"));
         let s = format!("{}", entry);
-        assert!(s.contains("[hash=a3f2c1]"), "message should contain hash prefix: {}", s);
-        assert!(s.contains("200"), "message should contain status code: {}", s);
+        assert!(
+            s.contains("[hash=a3f2c1]"),
+            "message should contain hash prefix: {}",
+            s
+        );
+        assert!(
+            s.contains("200"),
+            "message should contain status code: {}",
+            s
+        );
     }
 
     #[test]
     fn init_signal_has_no_hash_in_display() {
         let entry = SignalEntry::new(7, SignalKind::Init, "shellmcp/run_command");
         let s = format!("{}", entry);
-        assert!(!s.contains("[hash="), "INIT should not contain hash prefix: {}", s);
+        assert!(
+            !s.contains("[hash="),
+            "INIT should not contain hash prefix: {}",
+            s
+        );
     }
 }
