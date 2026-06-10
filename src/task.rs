@@ -102,12 +102,11 @@ impl Task {
     pub fn description(&self) -> String {
         match &self.kind {
             TaskKind::Mcp(def) => {
-                let params_str =
-                    if def.params.is_null() || def.params == serde_json::json!({}) {
-                        String::new()
-                    } else {
-                        format!(" {}", def.params)
-                    };
+                let params_str = if def.params.is_null() || def.params == serde_json::json!({}) {
+                    String::new()
+                } else {
+                    format!(" {}", def.params)
+                };
                 format!("{}/{}{}", def.server, def.tool, params_str)
             }
             TaskKind::Timer(def) => {
@@ -146,10 +145,7 @@ pub struct TaskStatus {
 #[serde(tag = "type")]
 pub enum TaskStatusKind {
     #[serde(rename = "mcp")]
-    Mcp {
-        server: String,
-        tool: String,
-    },
+    Mcp { server: String, tool: String },
     #[serde(rename = "timer")]
     Timer {
         label: String,

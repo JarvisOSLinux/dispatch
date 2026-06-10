@@ -318,11 +318,8 @@ pub async fn serve() -> io::Result<()> {
             Ok(r) => r,
             Err(e) => {
                 warn!("JSON-RPC parse error: {}", e);
-                let resp = JsonRpcResponse::error(
-                    Value::Null,
-                    -32700,
-                    format!("Parse error: {}", e),
-                );
+                let resp =
+                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {}", e));
                 write_response(&mut stdout, &resp).await?;
                 continue;
             }
@@ -346,9 +343,7 @@ pub async fn serve() -> io::Result<()> {
 
             "tools/list" => handle_tools_list(id),
 
-            "tools/call" => {
-                handle_tools_call(id, request.params, Arc::clone(&orchestrator)).await
-            }
+            "tools/call" => handle_tools_call(id, request.params, Arc::clone(&orchestrator)).await,
 
             "ping" => JsonRpcResponse::success(id, json!({})),
 
@@ -398,14 +393,8 @@ async fn handle_tools_call(
     params: Value,
     orchestrator: Arc<Mutex<Orchestrator>>,
 ) -> JsonRpcResponse {
-    let tool_name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or(json!({}));
+    let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     info!(tool = tool_name, "tools/call");
     match tool_name {
@@ -438,11 +427,7 @@ async fn handle_dispatch(
         Some(tasks_val) => match serde_json::from_value(tasks_val.clone()) {
             Ok(t) => t,
             Err(e) => {
-                return JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    format!("Invalid tasks: {}", e),
-                );
+                return JsonRpcResponse::error(id, -32602, format!("Invalid tasks: {}", e));
             }
         },
         None => {
@@ -464,7 +449,10 @@ async fn handle_dispatch(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let pids = orchestrator.lock().await.dispatch(tasks, strategy, session_id);
+    let pids = orchestrator
+        .lock()
+        .await
+        .dispatch(tasks, strategy, session_id);
 
     let signal_window = orchestrator.lock().await.wait_for_event().await;
 
@@ -492,11 +480,7 @@ async fn handle_kill(
         Some(v) => match serde_json::from_value(v.clone()) {
             Ok(p) => p,
             Err(e) => {
-                return JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    format!("Invalid pids: {}", e),
-                );
+                return JsonRpcResponse::error(id, -32602, format!("Invalid pids: {}", e));
             }
         },
         None => {
@@ -532,11 +516,7 @@ async fn handle_wait(
         Some(v) => match serde_json::from_value(v.clone()) {
             Ok(p) => p,
             Err(e) => {
-                return JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    format!("Invalid pids: {}", e),
-                );
+                return JsonRpcResponse::error(id, -32602, format!("Invalid pids: {}", e));
             }
         },
         None => {
@@ -727,14 +707,19 @@ async fn handle_browse_servers(id: Value, arguments: Value) -> JsonRpcResponse {
     };
     let min_score = match arguments.get("min_score").and_then(|v| v.as_f64()) {
         Some(f) => f,
-        None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'min_score' parameter"),
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing or invalid 'min_score' parameter")
+        }
     };
 
     match DmcpClient::browse_vector(&vector, top_k, min_score).await {
-        Ok(results) => JsonRpcResponse::success(id, json!({
-            "content": [{ "type": "text", "text": results.to_string() }],
-            "results": results
-        })),
+        Ok(results) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": results.to_string() }],
+                "results": results
+            }),
+        ),
         Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
     }
 }
@@ -753,43 +738,57 @@ async fn handle_browse_servers_batch(id: Value, arguments: Value) -> JsonRpcResp
     };
     let min_score = match arguments.get("min_score").and_then(|v| v.as_f64()) {
         Some(f) => f,
-        None => return JsonRpcResponse::error(id, -32602, "Missing or invalid 'min_score' parameter"),
+        None => {
+            return JsonRpcResponse::error(id, -32602, "Missing or invalid 'min_score' parameter")
+        }
     };
 
     match DmcpClient::browse_vectors(&vectors, top_k, min_score).await {
-        Ok(results) => JsonRpcResponse::success(id, json!({
-            "content": [{ "type": "text", "text": results.to_string() }],
-            "results": results
-        })),
+        Ok(results) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": results.to_string() }],
+                "results": results
+            }),
+        ),
         Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
     }
 }
 
 async fn handle_server_count(id: Value) -> JsonRpcResponse {
     match DmcpClient::server_count().await {
-        Ok(count) => JsonRpcResponse::success(id, json!({
-            "content": [{ "type": "text", "text": count.to_string() }],
-            "count": count
-        })),
+        Ok(count) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": count.to_string() }],
+                "count": count
+            }),
+        ),
         Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
     }
 }
 
 async fn handle_embedding_spec(id: Value) -> JsonRpcResponse {
     match DmcpClient::embedding_spec().await {
-        Ok(spec) => JsonRpcResponse::success(id, json!({
-            "content": [{ "type": "text", "text": spec.to_string() }],
-            "spec": spec
-        })),
+        Ok(spec) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": spec.to_string() }],
+                "spec": spec
+            }),
+        ),
         Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
     }
 }
 
 async fn handle_sync_index(id: Value) -> JsonRpcResponse {
     match DmcpClient::sync_index().await {
-        Ok(output) => JsonRpcResponse::success(id, json!({
-            "content": [{ "type": "text", "text": output }]
-        })),
+        Ok(output) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": output }]
+            }),
+        ),
         Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
     }
 }
@@ -808,17 +807,17 @@ async fn handle_index_server(id: Value, arguments: Value) -> JsonRpcResponse {
     };
 
     match DmcpClient::index_server(&server_id, &vectors).await {
-        Ok(output) => JsonRpcResponse::success(id, json!({
-            "content": [{ "type": "text", "text": output }]
-        })),
+        Ok(output) => JsonRpcResponse::success(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": output }]
+            }),
+        ),
         Err(e) => JsonRpcResponse::error(id, -32000, e.to_string()),
     }
 }
 
-async fn write_response(
-    stdout: &mut io::Stdout,
-    response: &JsonRpcResponse,
-) -> io::Result<()> {
+async fn write_response(stdout: &mut io::Stdout, response: &JsonRpcResponse) -> io::Result<()> {
     let json = serde_json::to_string(response).unwrap();
     stdout.write_all(json.as_bytes()).await?;
     stdout.write_all(b"\n").await?;

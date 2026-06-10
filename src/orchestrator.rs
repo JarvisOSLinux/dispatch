@@ -50,6 +50,12 @@ pub struct Orchestrator {
     current_session_id: Option<String>,
 }
 
+impl Default for Orchestrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Orchestrator {
     pub fn new() -> Self {
         let (reminder_tx, reminder_rx) = mpsc::channel(REMINDER_CHANNEL_SIZE);
@@ -207,11 +213,8 @@ impl Orchestrator {
             self.reminder_mgr.cancel(task_pid);
 
             info!(pid = task_pid, %message, "task killed");
-            self.signal_window.push(SignalEntry::new(
-                task_pid,
-                SignalKind::Kill,
-                message,
-            ));
+            self.signal_window
+                .push(SignalEntry::new(task_pid, SignalKind::Kill, message));
 
             killed.push(task_pid);
         }
@@ -265,9 +268,7 @@ impl Orchestrator {
     }
 
     pub fn has_running_tasks(&self) -> bool {
-        self.tasks
-            .values()
-            .any(|t| t.state == TaskState::Running)
+        self.tasks.values().any(|t| t.state == TaskState::Running)
     }
 
     /// All PIDs belonging to a given session.
@@ -356,10 +357,22 @@ impl Orchestrator {
                 let exit_entry = match output {
                     Ok(out) => {
                         info!(pid = result.pid, "MCP task completed");
-                        let raw = if out.is_empty() { "(no output)".to_string() } else { out };
+                        let raw = if out.is_empty() {
+                            "(no output)".to_string()
+                        } else {
+                            out
+                        };
 
-                        let defer = self.tasks.get(&result.pid)
-                            .and_then(|t| if let TaskKind::Mcp(def) = &t.kind { Some(def.defer_output) } else { None })
+                        let defer = self
+                            .tasks
+                            .get(&result.pid)
+                            .and_then(|t| {
+                                if let TaskKind::Mcp(def) = &t.kind {
+                                    Some(def.defer_output)
+                                } else {
+                                    None
+                                }
+                            })
                             .unwrap_or(false);
 
                         self.outputs.insert(result.pid, raw.clone());
@@ -367,12 +380,12 @@ impl Orchestrator {
                         let message = if defer {
                             match task_nonce.as_deref() {
                                 Some(h) => format!("[hash={h}] 200 (deferred)"),
-                                None    => "200 (deferred)".to_string(),
+                                None => "200 (deferred)".to_string(),
                             }
                         } else {
                             match task_nonce.as_deref() {
                                 Some(h) => format!("[hash={h}] 200 <{h}>{raw}</{h}>"),
-                                None    => format!("200 <raw>{raw}</raw>"),
+                                None => format!("200 <raw>{raw}</raw>"),
                             }
                         };
 
@@ -397,7 +410,11 @@ impl Orchestrator {
                 };
                 self.signal_window.push(exit_entry);
             }
-            TaskResultKind::TimerExpired { label, metadata, elapsed } => {
+            TaskResultKind::TimerExpired {
+                label,
+                metadata,
+                elapsed,
+            } => {
                 info!(pid = result.pid, %label, elapsed, "timer expired");
                 self.signal_window.push(SignalEntry::with_payload(
                     result.pid,
@@ -457,7 +474,11 @@ mod tests {
     use crate::task::TimerDef;
 
     fn timer_def(label: &str, duration: u64, metadata: Option<serde_json::Value>) -> TimerDef {
-        TimerDef { label: label.to_string(), duration, metadata }
+        TimerDef {
+            label: label.to_string(),
+            duration,
+            metadata,
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -478,7 +499,10 @@ mod tests {
         assert_eq!(signals[0].kind, SignalKind::Init);
         assert_eq!(signals[1].kind, SignalKind::Remind);
         assert_eq!(signals[2].kind, SignalKind::Exit);
-        let payload = signals[1].payload.as_ref().expect("REMIND should have payload");
+        let payload = signals[1]
+            .payload
+            .as_ref()
+            .expect("REMIND should have payload");
         assert_eq!(payload["type"], "REMIND");
         assert_eq!(payload["label"], "test_timer");
         assert_eq!(payload["elapsed"], 2);
@@ -516,7 +540,10 @@ mod tests {
         let _ = orch.wait_for_event().await;
         let signals = orch.signal_window.all();
         assert_eq!(signals.len(), 9);
-        let reminds: Vec<_> = signals.iter().filter(|s| s.kind == SignalKind::Remind).collect();
+        let reminds: Vec<_> = signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::Remind)
+            .collect();
         assert_eq!(reminds.len(), 3);
         let mut remind_pids: Vec<u64> = reminds.iter().map(|s| s.pid).collect();
         remind_pids.sort();
@@ -533,11 +560,17 @@ mod tests {
         let meta = json!({"goal_id": "abc123", "type": "goal_defer", "priority": 5});
         let mut orch = Orchestrator::new();
         let pid = orch.dispatch_timer(timer_def("goal_reminder", 2, Some(meta.clone())));
-        let init_payload = orch.signal_window.all()[0].payload.as_ref().expect("INIT should have payload");
+        let init_payload = orch.signal_window.all()[0]
+            .payload
+            .as_ref()
+            .expect("INIT should have payload");
         assert_eq!(init_payload["metadata"], meta);
         let _ = orch.wait_for_event().await;
         let signals = orch.signal_window.all();
-        let remind = signals.iter().find(|s| s.kind == SignalKind::Remind).unwrap();
+        let remind = signals
+            .iter()
+            .find(|s| s.kind == SignalKind::Remind)
+            .unwrap();
         let remind_payload = remind.payload.as_ref().expect("REMIND should have payload");
         assert_eq!(remind_payload["metadata"], meta);
         assert_eq!(remind_payload["label"], "goal_reminder");
