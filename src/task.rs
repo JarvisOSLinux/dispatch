@@ -70,7 +70,7 @@ impl Task {
             kind: TaskKind::Mcp(def),
             state: TaskState::Running,
             started_at: Instant::now(),
-            nonce: Some(crate::nonce::generate(pid)),
+            nonce: Some(crate::nonce::generate()),
             abort_handle: None,
         }
     }
