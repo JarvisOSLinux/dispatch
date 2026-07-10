@@ -1,6 +1,32 @@
 use crate::error::{DispatchError, Result};
+use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, warn};
+
+/// SIGKILLs a child's whole process group on drop, so aborting a task tears
+/// down the entire dmcp → MCP-server tree rather than orphaning grandchildren.
+/// Disarmed once the child has been reaped normally.
+#[cfg(unix)]
+struct GroupKiller(Option<u32>);
+
+#[cfg(unix)]
+impl GroupKiller {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GroupKiller {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            // The child was spawned as a group leader, so pgid == its pid.
+            unsafe {
+                libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
 
 /// Client for invoking dmcp commands.
 /// dispatch delegates all MCP server management to dmcp.
@@ -23,6 +49,10 @@ impl DmcpClient {
 
     /// Call a tool on an MCP server via `dmcp call <server> <tool> --args <json>`.
     /// Returns the stdout output as a string.
+    ///
+    /// The child is spawned in its own process group with kill-on-drop, so if
+    /// the orchestrator aborts this task (the `kill` tool), dropping this future
+    /// tears down the whole dmcp → MCP-server tree instead of leaving it running.
     pub async fn call_tool(server: &str, tool: &str, params: &serde_json::Value) -> Result<String> {
         debug!(server, tool, "calling dmcp tool");
         let mut cmd = Command::new("dmcp");
@@ -32,10 +62,29 @@ impl DmcpClient {
             cmd.arg("--args").arg(params.to_string());
         }
 
-        let output = cmd.output().await.map_err(|e| {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // Own process group so the whole tree can be signalled on abort.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let child = cmd.spawn().map_err(|e| {
             warn!(server, tool, error = %e, "failed to spawn dmcp");
             DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e))
         })?;
+
+        #[cfg(unix)]
+        let mut guard = GroupKiller(child.id());
+
+        let output = child.wait_with_output().await.map_err(|e| {
+            warn!(server, tool, error = %e, "failed to run dmcp");
+            DispatchError::DmcpError(format!("failed to run dmcp: {}", e))
+        })?;
+
+        #[cfg(unix)]
+        guard.disarm();
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -194,8 +243,12 @@ impl DmcpClient {
     }
 
     /// Index a non-approved server via `dmcp index-server <id> --vectors <json>`.
-    pub async fn index_server(server_id: &str, vectors: &[Vec<f64>]) -> Result<String> {
-        let vecs_json = serde_json::to_string(vectors)
+    ///
+    /// `payload` must be dmcp's expected object shape:
+    /// `{"server": [f32...], "tools": {"<tool>": [f32...]}}`. Passing a bare
+    /// array-of-arrays (the previous behavior) always failed dmcp's parser.
+    pub async fn index_server(server_id: &str, payload: &serde_json::Value) -> Result<String> {
+        let vecs_json = serde_json::to_string(payload)
             .map_err(|e| DispatchError::DmcpError(format!("failed to serialize vectors: {}", e)))?;
         let output = Command::new("dmcp")
             .arg("index-server")

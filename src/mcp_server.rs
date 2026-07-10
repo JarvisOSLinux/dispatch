@@ -283,16 +283,21 @@ fn tool_definitions() -> Value {
                         "type": "string",
                         "description": "ID of the server to index"
                     },
-                    "vectors": {
+                    "server": {
                         "type": "array",
-                        "items": {
+                        "items": { "type": "number" },
+                        "description": "Server-level embedding vector"
+                    },
+                    "tools": {
+                        "type": "object",
+                        "additionalProperties": {
                             "type": "array",
                             "items": { "type": "number" }
                         },
-                        "description": "Embedding vectors representing the server"
+                        "description": "Optional per-tool embedding vectors, keyed by tool name"
                     }
                 },
-                "required": ["server_id", "vectors"]
+                "required": ["server_id", "server"]
             }
         }
     ])
@@ -793,20 +798,28 @@ async fn handle_sync_index(id: Value) -> JsonRpcResponse {
     }
 }
 
+/// Build the `--vectors` payload dmcp expects: `{"server": [...], "tools": {...}}`.
+/// Returns an error message if the server vector is missing or not an array.
+fn index_payload_from_args(arguments: &Value) -> std::result::Result<Value, String> {
+    let server_vec = match arguments.get("server") {
+        Some(v) if v.is_array() => v.clone(),
+        _ => return Err("Missing or invalid 'server' vector".to_string()),
+    };
+    let tools = arguments.get("tools").cloned().unwrap_or_else(|| json!({}));
+    Ok(json!({ "server": server_vec, "tools": tools }))
+}
+
 async fn handle_index_server(id: Value, arguments: Value) -> JsonRpcResponse {
     let server_id = match arguments.get("server_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => return JsonRpcResponse::error(id, -32602, "Missing 'server_id' parameter"),
     };
-    let vectors: Vec<Vec<f64>> = match arguments.get("vectors") {
-        Some(v) => match serde_json::from_value(v.clone()) {
-            Ok(vecs) => vecs,
-            Err(e) => return JsonRpcResponse::error(id, -32602, format!("Invalid vectors: {}", e)),
-        },
-        None => return JsonRpcResponse::error(id, -32602, "Missing 'vectors' parameter"),
+    let payload = match index_payload_from_args(&arguments) {
+        Ok(p) => p,
+        Err(e) => return JsonRpcResponse::error(id, -32602, e),
     };
 
-    match DmcpClient::index_server(&server_id, &vectors).await {
+    match DmcpClient::index_server(&server_id, &payload).await {
         Ok(output) => JsonRpcResponse::success(
             id,
             json!({
@@ -823,4 +836,28 @@ async fn write_response(stdout: &mut io::Stdout, response: &JsonRpcResponse) -> 
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_payload_is_dmcp_object_shape() {
+        // dmcp reads .get("server") and .get("tools"); the payload must be an
+        // object, not the array-of-arrays that always failed dmcp's parser.
+        let args = json!({"server_id": "x", "server": [0.1, 0.2], "tools": {"t": [0.3]}});
+        let p = index_payload_from_args(&args).unwrap();
+        assert!(p.is_object());
+        assert!(p.get("server").unwrap().is_array());
+        assert!(p.get("tools").unwrap().is_object());
+    }
+
+    #[test]
+    fn index_payload_defaults_tools_and_requires_server() {
+        let p = index_payload_from_args(&json!({"server": [1.0]})).unwrap();
+        assert_eq!(p["tools"], json!({}));
+        assert!(index_payload_from_args(&json!({})).is_err());
+        assert!(index_payload_from_args(&json!({"server": "not-an-array"})).is_err());
+    }
 }
