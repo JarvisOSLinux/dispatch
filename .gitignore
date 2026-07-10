@@ -26,5 +26,8 @@ target
 /target
 
 # makepkg artifacts
+# NOTE: do NOT ignore src/ — that is the Rust source directory. makepkg's build
+# src/ collides with it, so run makepkg from a clean/separate checkout.
 dispatch-mcp-git/
-src/
+*.pkg.tar.zst
+pkg/
