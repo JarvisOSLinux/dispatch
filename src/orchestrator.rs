@@ -348,6 +348,15 @@ impl Orchestrator {
         }
     }
 
+    /// Fire-and-return snapshot for the request path: fold in any results that
+    /// already completed, then render the current signal window. Never awaits —
+    /// the daemon's poller delivers later signals, so `dispatch`/`timer` must
+    /// not block the shared MCP connection waiting for the next event (#22).
+    pub fn drain_and_context(&mut self) -> String {
+        self.drain_results();
+        self.format_wakeup_context(DEFAULT_WINDOW_SIZE)
+    }
+
     fn handle_task_result(&mut self, result: TaskResult) {
         self.reminder_mgr.cancel(result.pid);
         let task_nonce = self.tasks.get(&result.pid).and_then(|t| t.nonce.clone());
@@ -510,6 +519,27 @@ mod tests {
         assert!(signals[2].message.contains("timer completed"));
         assert!(signals[2].nonce.is_none());
         assert!(!orch.has_running_tasks());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_and_context_returns_immediately_with_running_task() {
+        // Fire-and-return (#22): a still-running task must not make the request
+        // path block. dispatch_timer enqueues INIT synchronously; the snapshot
+        // must reflect that INIT and return at once, without awaiting the
+        // REMIND/EXIT that only fire much later.
+        let mut orch = Orchestrator::new();
+        let pid = orch.dispatch_timer(timer_def("long_task", 3600, None));
+        assert!(orch.has_running_tasks());
+
+        let window = orch.drain_and_context();
+
+        // The task is still running and only INIT is present — we did not wait.
+        assert!(orch.has_running_tasks());
+        let signals = orch.signal_window.all();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].kind, SignalKind::Init);
+        assert_eq!(signals[0].pid, pid);
+        assert!(!window.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

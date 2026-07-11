@@ -454,26 +454,27 @@ async fn handle_dispatch(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let pids = orchestrator
-        .lock()
-        .await
-        .dispatch(tasks, strategy, session_id);
+    // Fire-and-return: dispatch synchronously enqueues INIT signals, then we
+    // render the current window and return immediately. We do NOT block on
+    // wait_for_event — the daemon captures INIT from this return and receives
+    // later EXIT/REMIND signals via its signal-window poller (#22). The lock is
+    // held only across synchronous calls, never across an await, so a
+    // concurrent kill/status/log is instantly serviceable.
+    let mut orch = orchestrator.lock().await;
+    let pids = orch.dispatch(tasks, strategy, session_id);
+    let window = orch.drain_and_context();
+    drop(orch);
 
-    let signal_window = orchestrator.lock().await.wait_for_event().await;
-
-    match signal_window {
-        Ok(window) => JsonRpcResponse::success(
-            id,
-            json!({
-                "content": [{
-                    "type": "text",
-                    "text": window
-                }],
-                "pids": pids
-            }),
-        ),
-        Err(e) => JsonRpcResponse::error(id, -32000, format!("Dispatch error: {}", e)),
-    }
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": window
+            }],
+            "pids": pids
+        }),
+    )
 }
 
 async fn handle_kill(
@@ -536,6 +537,12 @@ async fn handle_wait(
         }
     }
 
+    // `wait` deliberately blocks until the next event: the LLM (via the daemon's
+    // `wait` action) asks to block until these PIDs complete, and the caller
+    // consumes the returned EXIT signals. Unlike `dispatch`/`timer` this is an
+    // intentional block, not incidental contention; making it fire-and-return
+    // requires the coordinated daemon change tracked in #22 (consume completion
+    // from the poller/queue instead of this return).
     let signal_window = orchestrator.lock().await.wait_for_event().await;
 
     match signal_window {
@@ -554,7 +561,8 @@ async fn handle_wait(
 }
 
 async fn handle_status(id: Value, orchestrator: Arc<Mutex<Orchestrator>>) -> JsonRpcResponse {
-    let orch = orchestrator.lock().await;
+    let mut orch = orchestrator.lock().await;
+    orch.drain_results();
     let statuses = orch.status();
     JsonRpcResponse::success(
         id,
@@ -578,7 +586,8 @@ async fn handle_log(
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as usize;
 
-    let orch = orchestrator.lock().await;
+    let mut orch = orchestrator.lock().await;
+    orch.drain_results();
     let window_text = orch.log_text(count);
     let window_json = orch.log_json(count);
 
@@ -613,7 +622,8 @@ async fn handle_get_output(
         return JsonRpcResponse::error(id, -32602, "Empty pids list");
     }
 
-    let orch = orchestrator.lock().await;
+    let mut orch = orchestrator.lock().await;
+    orch.drain_results();
     let mut text_parts: Vec<String> = Vec::new();
     let mut outputs_map = serde_json::Map::new();
 
@@ -679,23 +689,23 @@ async fn handle_timer(
         metadata,
     };
 
-    let pid = orchestrator.lock().await.dispatch_timer(def);
+    // Fire-and-return: dispatch_timer synchronously enqueues the INIT signal;
+    // the REMIND fires later and is delivered via the daemon's poller (#22).
+    let mut orch = orchestrator.lock().await;
+    let pid = orch.dispatch_timer(def);
+    let window = orch.drain_and_context();
+    drop(orch);
 
-    let signal_window = orchestrator.lock().await.wait_for_event().await;
-
-    match signal_window {
-        Ok(window) => JsonRpcResponse::success(
-            id,
-            json!({
-                "content": [{
-                    "type": "text",
-                    "text": window
-                }],
-                "pid": pid
-            }),
-        ),
-        Err(e) => JsonRpcResponse::error(id, -32000, format!("Timer error: {}", e)),
-    }
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "content": [{
+                "type": "text",
+                "text": window
+            }],
+            "pid": pid
+        }),
+    )
 }
 
 async fn handle_browse_servers(id: Value, arguments: Value) -> JsonRpcResponse {
