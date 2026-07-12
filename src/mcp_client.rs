@@ -86,16 +86,25 @@ impl DmcpClient {
         #[cfg(unix)]
         guard.disarm();
 
+        // Status is read from the exit code, never by sniffing a sentinel in the
+        // output: dmcp exits 0 only when the tool succeeded, and non-zero on a
+        // tool-reported error (is_error) as well as on RPC failure.
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             debug!(server, tool, "dmcp call succeeded");
             Ok(stdout.trim().to_string())
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let msg = if stderr.is_empty() { stdout } else { stderr };
-            warn!(server, tool, error = %msg.trim(), "dmcp call failed");
-            Err(DispatchError::DmcpError(msg.trim().to_string()))
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            // The tool's own error detail is on stdout; prefer it, falling back
+            // to stderr (used for RPC/spawn failures).
+            let msg = if !stdout.trim().is_empty() {
+                stdout.trim().to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            warn!(server, tool, error = %msg, "dmcp call failed");
+            Err(DispatchError::DmcpError(msg))
         }
     }
 
