@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 use tracing::debug;
@@ -15,13 +17,17 @@ pub struct ReminderEvent {
 pub struct ReminderManager {
     timers: HashMap<u64, JoinHandle<()>>,
     tx: mpsc::Sender<ReminderEvent>,
+    /// Wakes the serve loop so a fired reminder is drained and pushed to the
+    /// LLM without waiting for the next request (#26).
+    wake: Arc<Notify>,
 }
 
 impl ReminderManager {
-    pub fn new(tx: mpsc::Sender<ReminderEvent>) -> Self {
+    pub fn new(tx: mpsc::Sender<ReminderEvent>, wake: Arc<Notify>) -> Self {
         Self {
             timers: HashMap::new(),
             tx,
+            wake,
         }
     }
 
@@ -30,6 +36,7 @@ impl ReminderManager {
     pub fn start(&mut self, pid: u64, interval_secs: u64) {
         debug!(pid, interval_secs, "starting reminder timer");
         let tx = self.tx.clone();
+        let wake = self.wake.clone();
         let handle = tokio::spawn(async move {
             let interval = Duration::from_secs(interval_secs);
             let mut elapsed: u64 = 0;
@@ -46,6 +53,7 @@ impl ReminderManager {
                 {
                     break;
                 }
+                wake.notify_one();
             }
         });
         self.timers.insert(pid, handle);

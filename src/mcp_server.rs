@@ -307,64 +307,132 @@ fn tool_definitions() -> Value {
 
 pub async fn serve() -> io::Result<()> {
     let orchestrator = Arc::new(Mutex::new(Orchestrator::new()));
+    let wake = orchestrator.lock().await.wake_handle();
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("JSON-RPC parse error: {}", e);
-                let resp =
-                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {}", e));
-                write_response(&mut stdout, &resp).await?;
-                continue;
-            }
-        };
-
-        let _ = &request.jsonrpc;
-
-        let id = request.id.clone().unwrap_or(Value::Null);
-        debug!(method = %request.method, "received JSON-RPC request");
-
-        let response = match request.method.as_str() {
-            "initialize" => {
-                info!("client initializing");
-                handle_initialize(id)
-            }
-
-            "notifications/initialized" => {
-                info!("client initialized");
-                continue;
-            }
-
-            "tools/list" => handle_tools_list(id),
-
-            "tools/call" => handle_tools_call(id, request.params, Arc::clone(&orchestrator)).await,
-
-            "ping" => JsonRpcResponse::success(id, json!({})),
-
-            _ => {
-                if request.id.is_none() {
-                    continue;
+    // The loop selects between two sources: incoming JSON-RPC requests on
+    // stdin, and the wake notification raised when a background task result or
+    // reminder is ready. Requests are answered as before; wakes drain the
+    // completed signals and PUSH them to the client as JSON-RPC notifications,
+    // so the LLM is woken on task completion without polling (#26). Because
+    // this is a single task, stdout writes never interleave.
+    loop {
+        tokio::select! {
+            line_res = lines.next_line() => {
+                match line_res {
+                    Ok(Some(line)) => {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Some(response) =
+                            handle_line(line, &orchestrator).await
+                        {
+                            write_response(&mut stdout, &response).await?;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("stdin read error: {}", e);
+                        break;
+                    }
                 }
-                warn!(method = %request.method, "unknown method");
-                JsonRpcResponse::error(id, -32601, "Method not found")
             }
-        };
-
-        write_response(&mut stdout, &response).await?;
+            _ = wake.notified() => {
+                let signals = {
+                    let mut orch = orchestrator.lock().await;
+                    orch.drain_emittable()
+                };
+                for sig in &signals {
+                    emit_signal_notification(&mut stdout, sig).await?;
+                }
+            }
+        }
     }
 
     orchestrator.lock().await.shutdown();
+    Ok(())
+}
+
+/// Parse and dispatch a single JSON-RPC line. Returns the response to write,
+/// or `None` for notifications and unknown-method notifications that must not
+/// be answered.
+async fn handle_line(
+    line: &str,
+    orchestrator: &Arc<Mutex<Orchestrator>>,
+) -> Option<JsonRpcResponse> {
+    let request: JsonRpcRequest = match serde_json::from_str(line) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("JSON-RPC parse error: {}", e);
+            return Some(JsonRpcResponse::error(
+                Value::Null,
+                -32700,
+                format!("Parse error: {}", e),
+            ));
+        }
+    };
+
+    let _ = &request.jsonrpc;
+
+    let id = request.id.clone().unwrap_or(Value::Null);
+    debug!(method = %request.method, "received JSON-RPC request");
+
+    let response = match request.method.as_str() {
+        "initialize" => {
+            info!("client initializing");
+            handle_initialize(id)
+        }
+
+        "notifications/initialized" => {
+            info!("client initialized");
+            return None;
+        }
+
+        "tools/list" => handle_tools_list(id),
+
+        "tools/call" => handle_tools_call(id, request.params, Arc::clone(orchestrator)).await,
+
+        "ping" => JsonRpcResponse::success(id, json!({})),
+
+        _ => {
+            // Unknown notifications (no id) get no response; unknown requests
+            // get a method-not-found error.
+            request.id.as_ref()?;
+            warn!(method = %request.method, "unknown method");
+            JsonRpcResponse::error(id, -32601, "Method not found")
+        }
+    };
+
+    Some(response)
+}
+
+/// Push a signal to the client as an MCP logging notification
+/// (`notifications/message`). The `logger` field tags it as a dispatch signal
+/// so the daemon's logging handler can distinguish it from other logging, and
+/// `data` carries the raw signal (kind/message/pid/timestamp/nonce) for the
+/// daemon to normalize and enqueue (#26).
+async fn emit_signal_notification(
+    stdout: &mut io::Stdout,
+    signal: &crate::signal::SignalEntry,
+) -> io::Result<()> {
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {
+            "level": "info",
+            "logger": "dispatch.signal",
+            "data": signal,
+        }
+    });
+    let json = serde_json::to_string(&notification).unwrap();
+    stdout.write_all(json.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
     Ok(())
 }
 
@@ -456,13 +524,14 @@ async fn handle_dispatch(
 
     // Fire-and-return: dispatch synchronously enqueues INIT signals, then we
     // render the current window and return immediately. We do NOT block on
-    // wait_for_event — the daemon captures INIT from this return and receives
-    // later EXIT/REMIND signals via its signal-window poller (#22). The lock is
-    // held only across synchronous calls, never across an await, so a
-    // concurrent kill/status/log is instantly serviceable.
+    // wait_for_event — the daemon captures INIT from this return and is woken
+    // for later EXIT/REMIND signals by the pushed notifications (#22, #26). The
+    // lock is held only across synchronous calls, never across an await, so a
+    // concurrent kill/status/log is instantly serviceable, and we must not
+    // drain here — the serve loop's wake path drains and pushes completions.
     let mut orch = orchestrator.lock().await;
     let pids = orch.dispatch(tasks, strategy, session_id);
-    let window = orch.drain_and_context();
+    let window = orch.wakeup_context();
     drop(orch);
 
     JsonRpcResponse::success(
@@ -561,8 +630,9 @@ async fn handle_wait(
 }
 
 async fn handle_status(id: Value, orchestrator: Arc<Mutex<Orchestrator>>) -> JsonRpcResponse {
-    let mut orch = orchestrator.lock().await;
-    orch.drain_results();
+    // No draining here: the serve loop's wake path (drain_emittable) is the sole
+    // drainer so completions can be pushed. We report the current window (#26).
+    let orch = orchestrator.lock().await;
     let statuses = orch.status();
     JsonRpcResponse::success(
         id,
@@ -586,8 +656,7 @@ async fn handle_log(
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as usize;
 
-    let mut orch = orchestrator.lock().await;
-    orch.drain_results();
+    let orch = orchestrator.lock().await;
     let window_text = orch.log_text(count);
     let window_json = orch.log_json(count);
 
@@ -622,8 +691,9 @@ async fn handle_get_output(
         return JsonRpcResponse::error(id, -32602, "Empty pids list");
     }
 
-    let mut orch = orchestrator.lock().await;
-    orch.drain_results();
+    // Output is stored by drain_emittable before the EXIT is pushed, so by the
+    // time the LLM asks for it here it is already present — no drain needed (#26).
+    let orch = orchestrator.lock().await;
     let mut text_parts: Vec<String> = Vec::new();
     let mut outputs_map = serde_json::Map::new();
 
@@ -690,10 +760,12 @@ async fn handle_timer(
     };
 
     // Fire-and-return: dispatch_timer synchronously enqueues the INIT signal;
-    // the REMIND fires later and is delivered via the daemon's poller (#22).
+    // the REMIND/EXIT fire later and are pushed by the serve loop's wake path
+    // (#22, #26). Do not drain here — that would steal the completion before it
+    // can be pushed.
     let mut orch = orchestrator.lock().await;
     let pid = orch.dispatch_timer(def);
-    let window = orch.drain_and_context();
+    let window = orch.wakeup_context();
     drop(orch);
 
     JsonRpcResponse::success(

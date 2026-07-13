@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::json;
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -48,6 +50,10 @@ pub struct Orchestrator {
     /// The session_id from the most recent dispatch call.
     /// format_wakeup_context() filters the window to this session when set.
     current_session_id: Option<String>,
+    /// Notified whenever a background task result or reminder becomes available,
+    /// so the serve loop drains and pushes signals to the LLM immediately
+    /// instead of waiting for the next request (#26).
+    wake: Arc<Notify>,
 }
 
 impl Default for Orchestrator {
@@ -60,10 +66,11 @@ impl Orchestrator {
     pub fn new() -> Self {
         let (reminder_tx, reminder_rx) = mpsc::channel(REMINDER_CHANNEL_SIZE);
         let (task_result_tx, task_result_rx) = mpsc::channel(TASK_CHANNEL_SIZE);
+        let wake = Arc::new(Notify::new());
         Self {
             tasks: HashMap::new(),
             signal_window: SignalWindow::new(DEFAULT_WINDOW_SIZE),
-            reminder_mgr: ReminderManager::new(reminder_tx),
+            reminder_mgr: ReminderManager::new(reminder_tx, wake.clone()),
             reminder_rx,
             task_result_rx,
             task_result_tx,
@@ -71,7 +78,14 @@ impl Orchestrator {
             strategy: None,
             pid_to_session: HashMap::new(),
             current_session_id: None,
+            wake,
         }
+    }
+
+    /// A handle the serve loop awaits (`wake.notified()`) to learn when a
+    /// background task result or reminder is ready to drain and push (#26).
+    pub fn wake_handle(&self) -> Arc<Notify> {
+        self.wake.clone()
     }
 
     /// Dispatch a batch of MCP tasks for concurrent execution.
@@ -116,6 +130,7 @@ impl Orchestrator {
             }
 
             let tx = self.task_result_tx.clone();
+            let wake = self.wake.clone();
             let mcp_def = task.mcp_def();
             let server = mcp_def.server.clone();
             let tool = mcp_def.tool.clone();
@@ -133,6 +148,7 @@ impl Orchestrator {
                         kind: TaskResultKind::McpComplete(output),
                     })
                     .await;
+                wake.notify_one();
             });
 
             task.abort_handle = Some(join_handle.abort_handle());
@@ -162,6 +178,7 @@ impl Orchestrator {
         ));
 
         let tx = self.task_result_tx.clone();
+        let wake = self.wake.clone();
         let duration = def.duration;
         let label = def.label.clone();
         let metadata = def.metadata.clone();
@@ -178,6 +195,7 @@ impl Orchestrator {
                     },
                 })
                 .await;
+            wake.notify_one();
         });
 
         task.abort_handle = Some(join_handle.abort_handle());
@@ -344,22 +362,73 @@ impl Orchestrator {
 
     pub fn drain_results(&mut self) {
         while let Ok(result) = self.task_result_rx.try_recv() {
-            self.handle_task_result(result);
+            let _ = self.handle_task_result(result);
         }
     }
 
-    /// Fire-and-return snapshot for the request path: fold in any results that
-    /// already completed, then render the current signal window. Never awaits —
-    /// the daemon's poller delivers later signals, so `dispatch`/`timer` must
-    /// not block the shared MCP connection waiting for the next event (#22).
-    pub fn drain_and_context(&mut self) -> String {
-        self.drain_results();
+    /// Drain completed task results and fired reminders into the signal window,
+    /// returning the signals that should be pushed to the LLM as notifications
+    /// (EXIT — respecting `fire_wake` — and REMIND). INIT/WAIT/KILL are never
+    /// returned: INIT is delivered inline by the dispatch call, WAIT/KILL are
+    /// synchronous to the LLM's own tool calls.
+    ///
+    /// This is the SOLE proactive drainer of the result/reminder channels on
+    /// the request-free path. Request handlers must NOT drain (that would steal
+    /// results before they can be pushed) — they render whatever is already in
+    /// the window (#26).
+    pub fn drain_emittable(&mut self) -> Vec<SignalEntry> {
+        let mut emit = Vec::new();
+
+        while let Ok(result) = self.task_result_rx.try_recv() {
+            let pid = result.pid;
+            let fire_wake = self
+                .tasks
+                .get(&pid)
+                .map(|t| match &t.kind {
+                    TaskKind::Mcp(def) => def.fire_wake,
+                    TaskKind::Timer(_) => true,
+                })
+                .unwrap_or(true);
+            let produced = self.handle_task_result(result);
+            if fire_wake || !self.has_running_tasks() {
+                emit.extend(produced);
+            }
+        }
+
+        while let Ok(event) = self.reminder_rx.try_recv() {
+            if let Some(task) = self.tasks.get(&event.pid) {
+                if task.is_running() {
+                    info!(
+                        pid = event.pid,
+                        elapsed = event.elapsed_secs,
+                        "reminder fired, pushing to LLM"
+                    );
+                    let entry = SignalEntry::new(
+                        event.pid,
+                        SignalKind::Remind,
+                        format!("Running for {}s", event.elapsed_secs),
+                    );
+                    self.signal_window.push(entry.clone());
+                    emit.push(entry);
+                }
+            }
+        }
+
+        emit
+    }
+
+    /// Render the current signal window for the request path without draining —
+    /// completed results are folded in and pushed by the serve loop's wake path
+    /// (`drain_emittable`), so `dispatch`/`timer` must not block or steal them
+    /// here (#22, #26).
+    pub fn wakeup_context(&self) -> String {
         self.format_wakeup_context(DEFAULT_WINDOW_SIZE)
     }
 
-    fn handle_task_result(&mut self, result: TaskResult) {
+    fn handle_task_result(&mut self, result: TaskResult) -> Vec<SignalEntry> {
         self.reminder_mgr.cancel(result.pid);
         let task_nonce = self.tasks.get(&result.pid).and_then(|t| t.nonce.clone());
+        let mut produced = Vec::new();
 
         match result.kind {
             TaskResultKind::McpComplete(output) => {
@@ -417,7 +486,8 @@ impl Orchestrator {
                         }
                     }
                 };
-                self.signal_window.push(exit_entry);
+                self.signal_window.push(exit_entry.clone());
+                produced.push(exit_entry);
             }
             TaskResultKind::TimerExpired {
                 label,
@@ -425,7 +495,7 @@ impl Orchestrator {
                 elapsed,
             } => {
                 info!(pid = result.pid, %label, elapsed, "timer expired");
-                self.signal_window.push(SignalEntry::with_payload(
+                let remind_entry = SignalEntry::with_payload(
                     result.pid,
                     SignalKind::Remind,
                     format!("timer \"{}\" — {}s elapsed", label, elapsed),
@@ -436,18 +506,21 @@ impl Orchestrator {
                         "metadata": metadata,
                         "elapsed": elapsed,
                     }),
-                ));
-                self.signal_window.push(SignalEntry::new(
-                    result.pid,
-                    SignalKind::Exit,
-                    "timer completed",
-                ));
+                );
+                self.signal_window.push(remind_entry.clone());
+                produced.push(remind_entry);
+
+                let exit_entry = SignalEntry::new(result.pid, SignalKind::Exit, "timer completed");
+                self.signal_window.push(exit_entry.clone());
+                produced.push(exit_entry);
             }
         }
 
         if let Some(task) = self.tasks.get_mut(&result.pid) {
             task.mark_exited();
         }
+
+        produced
     }
 
     pub fn shutdown(&mut self) {
@@ -522,7 +595,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn drain_and_context_returns_immediately_with_running_task() {
+    async fn wakeup_context_returns_immediately_with_running_task() {
         // Fire-and-return (#22): a still-running task must not make the request
         // path block. dispatch_timer enqueues INIT synchronously; the snapshot
         // must reflect that INIT and return at once, without awaiting the
@@ -531,7 +604,7 @@ mod tests {
         let pid = orch.dispatch_timer(timer_def("long_task", 3600, None));
         assert!(orch.has_running_tasks());
 
-        let window = orch.drain_and_context();
+        let window = orch.wakeup_context();
 
         // The task is still running and only INIT is present — we did not wait.
         assert!(orch.has_running_tasks());
@@ -540,6 +613,33 @@ mod tests {
         assert_eq!(signals[0].kind, SignalKind::Init);
         assert_eq!(signals[0].pid, pid);
         assert!(!window.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_emittable_returns_exit_signals_for_pushing() {
+        // The serve loop's wake path drains completed results and returns the
+        // EXIT/REMIND signals to push to the LLM (#26).
+        let mut orch = Orchestrator::new();
+        orch.dispatch_timer(timer_def("quick", 1, None));
+        // Nothing has fired yet: draining is a no-op.
+        assert!(orch.drain_emittable().is_empty());
+
+        // Let the spawned timer task register its sleep before advancing the
+        // (paused) clock past it, then let it wake, send, and notify.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+
+        let emitted = orch.drain_emittable();
+        // A timer expiry produces a REMIND ("Ns elapsed") and an EXIT.
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].kind, SignalKind::Remind);
+        assert_eq!(emitted[1].kind, SignalKind::Exit);
+        assert!(!orch.has_running_tasks());
+        // Draining again yields nothing — the result was consumed once.
+        assert!(orch.drain_emittable().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
