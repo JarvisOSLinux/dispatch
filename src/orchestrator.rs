@@ -50,6 +50,11 @@ pub struct Orchestrator {
     /// The session_id from the most recent dispatch call.
     /// format_wakeup_context() filters the window to this session when set.
     current_session_id: Option<String>,
+    /// EXIT signals from fire_wake=false tasks, held until their session settles
+    /// (no task in that session still running) and then flushed together, so a
+    /// coalesced batch is delivered as a group instead of dropped (#28). Keyed by
+    /// session (None = the no-session group).
+    held: HashMap<Option<String>, Vec<SignalEntry>>,
     /// Notified whenever a background task result or reminder becomes available,
     /// so the serve loop drains and pushes signals to the LLM immediately
     /// instead of waiting for the next request (#26).
@@ -78,6 +83,7 @@ impl Orchestrator {
             strategy: None,
             pid_to_session: HashMap::new(),
             current_session_id: None,
+            held: HashMap::new(),
             wake,
         }
     }
@@ -237,6 +243,12 @@ impl Orchestrator {
             killed.push(task_pid);
         }
 
+        // Killing a session's last running task settles it, so wake the serve
+        // loop to flush any held fire_wake=false signals for that session (#28).
+        if !killed.is_empty() {
+            self.wake.notify_one();
+        }
+
         Ok(killed)
     }
 
@@ -296,6 +308,17 @@ impl Orchestrator {
             .filter(|(_, sid)| sid.as_str() == session_id)
             .map(|(pid, _)| *pid)
             .collect()
+    }
+
+    /// True if any task in the given session is still running (None = the
+    /// no-session group). Scopes fire_wake=false "settle" per session so a held
+    /// batch in one goal isn't kept waiting by an unrelated running task in
+    /// another concurrent goal (#28, #142).
+    fn session_has_running(&self, session: Option<&str>) -> bool {
+        self.tasks.values().any(|t| {
+            t.state == TaskState::Running
+                && self.pid_to_session.get(&t.pid).map(|s| s.as_str()) == session
+        })
     }
 
     /// Format the signal window prepended with the current strategy (if set).
@@ -389,9 +412,14 @@ impl Orchestrator {
                     TaskKind::Timer(_) => true,
                 })
                 .unwrap_or(true);
+            let session = self.pid_to_session.get(&pid).cloned();
             let produced = self.handle_task_result(result);
-            if fire_wake || !self.has_running_tasks() {
+            if fire_wake {
                 emit.extend(produced);
+            } else {
+                // Hold until this task's session settles, then flush together —
+                // never drop it (#28).
+                self.held.entry(session).or_default().extend(produced);
             }
         }
 
@@ -414,7 +442,26 @@ impl Orchestrator {
             }
         }
 
+        self.flush_settled_sessions(&mut emit);
+
         emit
+    }
+
+    /// Move held fire_wake=false signals into `emit` for every session whose
+    /// tasks have all finished (#28). Also called after a kill, since killing a
+    /// session's last running task settles it.
+    fn flush_settled_sessions(&mut self, emit: &mut Vec<SignalEntry>) {
+        let settled: Vec<Option<String>> = self
+            .held
+            .keys()
+            .filter(|session| !self.session_has_running(session.as_deref()))
+            .cloned()
+            .collect();
+        for session in settled {
+            if let Some(signals) = self.held.remove(&session) {
+                emit.extend(signals);
+            }
+        }
     }
 
     /// Render the current signal window for the request path without draining —
@@ -561,6 +608,96 @@ mod tests {
             duration,
             metadata,
         }
+    }
+
+    // -- fire_wake=false held-batch helpers (#28) --------------------------
+
+    fn insert_running_mcp(
+        orch: &mut Orchestrator,
+        pid: u64,
+        session: Option<&str>,
+        fire_wake: bool,
+    ) {
+        let def = TaskDef {
+            server: "s".into(),
+            tool: "t".into(),
+            params: json!({}),
+            remind_after: None,
+            fire_wake,
+            defer_output: false,
+        };
+        orch.tasks.insert(pid, Task::new_mcp(pid, def));
+        if let Some(sid) = session {
+            orch.pid_to_session.insert(pid, sid.to_string());
+        }
+    }
+
+    fn complete_mcp(orch: &Orchestrator, pid: u64, output: &str) {
+        orch.task_result_tx
+            .try_send(TaskResult {
+                pid,
+                kind: TaskResultKind::McpComplete(Ok(output.to_string())),
+            })
+            .expect("channel has capacity");
+    }
+
+    fn exit_pids(signals: &[SignalEntry]) -> Vec<u64> {
+        signals
+            .iter()
+            .filter(|s| s.kind == SignalKind::Exit)
+            .map(|s| s.pid)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fire_wake_false_batch_delivered_together_on_settle() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, Some("goalA"), false);
+        insert_running_mcp(&mut orch, 2, Some("goalA"), false);
+
+        // Task 1 finishes while task 2 runs: held, nothing pushed yet.
+        complete_mcp(&orch, 1, "out1");
+        assert!(orch.drain_emittable().is_empty());
+
+        // Task 2 finishes: the session settles, so BOTH are flushed together.
+        complete_mcp(&orch, 2, "out2");
+        assert_eq!(exit_pids(&orch.drain_emittable()), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn fire_wake_false_settle_is_session_scoped() {
+        // A held task in goalA must not wait on an unrelated running task in goalB.
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, Some("goalA"), false);
+        insert_running_mcp(&mut orch, 2, Some("goalB"), false); // stays running
+
+        complete_mcp(&orch, 1, "out1");
+        assert_eq!(exit_pids(&orch.drain_emittable()), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn kill_flushes_held_signals_for_settled_session() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, Some("goalA"), false);
+        insert_running_mcp(&mut orch, 2, Some("goalA"), false);
+
+        complete_mcp(&orch, 1, "out1");
+        assert!(orch.drain_emittable().is_empty());
+
+        // Killing task 2 settles the session; the held task-1 exit flushes.
+        orch.kill(&[2]).expect("kill succeeds");
+        assert_eq!(exit_pids(&orch.drain_emittable()), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn fire_wake_true_still_emits_immediately_with_running_sibling() {
+        // A fire_wake=true task is never held, even while a sibling runs.
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, Some("goalA"), true);
+        insert_running_mcp(&mut orch, 2, Some("goalA"), false);
+
+        complete_mcp(&orch, 1, "out1");
+        assert_eq!(exit_pids(&orch.drain_emittable()), vec![1]);
     }
 
     #[tokio::test(start_paused = true)]
