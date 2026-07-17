@@ -28,6 +28,87 @@ impl Drop for GroupKiller {
     }
 }
 
+/// Windows equivalent of GroupKiller: the child is assigned to a Job Object
+/// with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so terminating (or closing) the
+/// job tears down the whole dmcp → MCP-server tree, mirroring killpg on Unix.
+/// Disarmed once the child has been reaped normally.
+#[cfg(windows)]
+struct JobKiller(Option<windows_sys::Win32::Foundation::HANDLE>);
+
+// HANDLE is an opaque numeric identifier with no thread affinity; every
+// Win32 call we make on it (TerminateJobObject, CloseHandle) is thread-safe.
+#[cfg(windows)]
+unsafe impl Send for JobKiller {}
+
+#[cfg(windows)]
+impl JobKiller {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobKiller {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        if let Some(job) = self.0 {
+            unsafe {
+                // Kills every process still assigned to the job (the whole tree).
+                TerminateJobObject(job, 1);
+                CloseHandle(job);
+            }
+        }
+    }
+}
+
+/// Create a Job Object that kills all member processes when the job handle is
+/// closed, and assign `child_handle` to it. Returns None (best-effort, logged)
+/// on any Win32 failure rather than failing the whole dispatch.
+#[cfg(windows)]
+fn assign_to_killable_job(
+    child_handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            warn!("failed to create Job Object for dmcp process tree");
+            return None;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            warn!("failed to configure Job Object kill-on-close limit");
+            CloseHandle(job);
+            return None;
+        }
+
+        if AssignProcessToJobObject(job, child_handle) == 0 {
+            warn!("failed to assign dmcp process to Job Object");
+            CloseHandle(job);
+            return None;
+        }
+
+        Some(job)
+    }
+}
+
 /// Client for invoking dmcp commands.
 /// dispatch delegates all MCP server management to dmcp.
 pub struct DmcpClient;
@@ -78,12 +159,22 @@ impl DmcpClient {
         #[cfg(unix)]
         let mut guard = GroupKiller(child.id());
 
+        // Assign to a killable Job Object immediately after spawn so the whole
+        // tree can be torn down on abort, mirroring the Unix process group.
+        #[cfg(windows)]
+        let mut guard = {
+            let job = child
+                .raw_handle()
+                .and_then(|h| assign_to_killable_job(h as windows_sys::Win32::Foundation::HANDLE));
+            JobKiller(job)
+        };
+
         let output = child.wait_with_output().await.map_err(|e| {
             warn!(server, tool, error = %e, "failed to run dmcp");
             DispatchError::DmcpError(format!("failed to run dmcp: {}", e))
         })?;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         guard.disarm();
 
         // Status is read from the exit code, never by sniffing a sentinel in the

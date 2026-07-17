@@ -14,6 +14,10 @@ fn default_fire_wake() -> bool {
     true
 }
 
+fn default_defer_output() -> bool {
+    true
+}
+
 /// A task definition as received from the LLM (MCP server call).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDef {
@@ -29,8 +33,10 @@ pub struct TaskDef {
     #[serde(default = "default_fire_wake")]
     pub fire_wake: bool,
     /// Store output out-of-band instead of inlining it in the EXIT signal.
-    /// Use for large payloads where inline content would bloat the signal window.
-    #[serde(default)]
+    /// Default: true — successful output stays out of the LLM's context unless
+    /// explicitly retrieved via `get_output`, per the Cryptographic Boundary
+    /// Protocol threat model. Set false to inline small/trusted payloads.
+    #[serde(default = "default_defer_output")]
     pub defer_output: bool,
 }
 

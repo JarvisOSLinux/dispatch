@@ -93,7 +93,7 @@ fn tool_definitions() -> Value {
                                 },
                                 "defer_output": {
                                     "type": "boolean",
-                                    "description": "If true, store output out-of-band and show only '[hash=h] 200 (deferred)' in the EXIT signal. Use for large payloads to keep the signal window compact. Default: false (output inlined as '[hash=h] 200 <h>output</h>')."
+                                    "description": "Default: true. Output is stored out-of-band and the EXIT signal shows only '[hash=h] 200 (deferred)' — successful output never enters the LLM's context unless explicitly retrieved via get_output. Set false to inline small/trusted payloads directly as '[hash=h] 200 <h>output</h>'."
                                 }
                             },
                             "required": ["server", "tool"]
@@ -165,7 +165,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "get_output",
-            "description": "Retrieve the full output from one or more completed MCP tasks. By default, output is already inlined in the EXIT signal as '[hash=h] 200 <h>output</h>' — use this tool to re-read output, or to retrieve output from tasks that used defer_output: true (those show only '[hash=h] 200 (deferred)' in the signal window). Failed tasks (500) have no stored output; check the signal log for error details.",
+            "description": "Retrieve the full output from one or more completed MCP tasks. By default output is deferred (shown only as '[hash=h] 200 (deferred)' in the EXIT signal) — use this tool to fetch it. Also works for tasks that set defer_output: false, to re-read output already inlined. Failed tasks (500) have no stored output; check the signal log for error details.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
