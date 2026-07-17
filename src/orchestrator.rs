@@ -451,7 +451,7 @@ impl Orchestrator {
                                     None
                                 }
                             })
-                            .unwrap_or(false);
+                            .unwrap_or(true);
 
                         self.outputs.insert(result.pid, raw.clone());
 
