@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::mcp_client::DmcpClient;
-use crate::orchestrator::Orchestrator;
+use crate::orchestrator::{Emission, Orchestrator};
 use crate::task::{TaskDef, TimerDef};
 
 // --- JSON-RPC types ---
@@ -93,7 +93,7 @@ fn tool_definitions() -> Value {
                                 },
                                 "defer_output": {
                                     "type": "boolean",
-                                    "description": "Default: true. Output is stored out-of-band and the EXIT signal shows only '[hash=h] 200 (deferred)' — successful output never enters the LLM's context unless explicitly retrieved via get_output. Set false to inline small/trusted payloads directly as '[hash=h] 200 <h>output</h>'."
+                                    "description": "If true, store output out-of-band and show only '[hash=h] 200 (deferred)' in the EXIT signal. Use for large payloads to keep the signal window compact. Default: false (output inlined as '[hash=h] 200 <h>output</h>')."
                                 }
                             },
                             "required": ["server", "tool"]
@@ -165,7 +165,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "get_output",
-            "description": "Retrieve the full output from one or more completed MCP tasks. By default output is deferred (shown only as '[hash=h] 200 (deferred)' in the EXIT signal) — use this tool to fetch it. Also works for tasks that set defer_output: false, to re-read output already inlined. Failed tasks (500) have no stored output; check the signal log for error details.",
+            "description": "Retrieve the full output from one or more completed MCP tasks. By default, output is already inlined in the EXIT signal as '[hash=h] 200 <h>output</h>' — use this tool to re-read output, or to retrieve output from tasks that used defer_output: true (those show only '[hash=h] 200 (deferred)' in the signal window). Failed tasks (500) have no stored output; check the signal log for error details.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -343,12 +343,22 @@ pub async fn serve() -> io::Result<()> {
                 }
             }
             _ = wake.notified() => {
-                let signals = {
+                let emissions = {
                     let mut orch = orchestrator.lock().await;
                     orch.drain_emittable()
                 };
-                for sig in &signals {
-                    emit_signal_notification(&mut stdout, sig).await?;
+                for emission in &emissions {
+                    match emission {
+                        // fire_wake=true / reminders: one signal per notification.
+                        Emission::Single(sig) => {
+                            emit_signal_notification(&mut stdout, sig).await?;
+                        }
+                        // fire_wake=false settle-flush: merged group, one batch
+                        // notification -> one ROOT turn on the daemon side (#28).
+                        Emission::Batch(sigs) => {
+                            emit_batch_notification(&mut stdout, sigs).await?;
+                        }
+                    }
                 }
             }
         }
@@ -427,6 +437,31 @@ async fn emit_signal_notification(
             "level": "info",
             "logger": "dispatch.signal",
             "data": signal,
+        }
+    });
+    let json = serde_json::to_string(&notification).unwrap();
+    stdout.write_all(json.as_bytes()).await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+/// Push a merged fire_wake=false group as a single batch notification: same
+/// `dispatch.signal` logging notification, but `data` is the LIST of held
+/// signals so the daemon runs the whole group as one ROOT turn (#28). The
+/// individual-signal path (above) stays a single dict, so the default
+/// fire_wake=true wire format is unchanged.
+async fn emit_batch_notification(
+    stdout: &mut io::Stdout,
+    signals: &[crate::signal::SignalEntry],
+) -> io::Result<()> {
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {
+            "level": "info",
+            "logger": "dispatch.signal",
+            "data": signals,
         }
     });
     let json = serde_json::to_string(&notification).unwrap();
