@@ -32,6 +32,17 @@ enum TaskResultKind {
     },
 }
 
+/// How the serve loop should push a drained signal (#28).
+///
+/// `fire_wake` is the sole merge control: `fire_wake=true` signals (and
+/// reminders) flow one by one as `Single`; a `fire_wake=false` group, held until
+/// its session settles, is merged into one `Batch` so the daemon runs it as a
+/// single LLM turn.
+pub enum Emission {
+    Single(SignalEntry),
+    Batch(Vec<SignalEntry>),
+}
+
 /// The orchestrator manages tasks, signals, reminders, and completed output.
 pub struct Orchestrator {
     tasks: HashMap<u64, Task>,
@@ -399,7 +410,7 @@ impl Orchestrator {
     /// the request-free path. Request handlers must NOT drain (that would steal
     /// results before they can be pushed) — they render whatever is already in
     /// the window (#26).
-    pub fn drain_emittable(&mut self) -> Vec<SignalEntry> {
+    pub fn drain_emittable(&mut self) -> Vec<Emission> {
         let mut emit = Vec::new();
 
         while let Ok(result) = self.task_result_rx.try_recv() {
@@ -415,10 +426,11 @@ impl Orchestrator {
             let session = self.pid_to_session.get(&pid).cloned();
             let produced = self.handle_task_result(result);
             if fire_wake {
-                emit.extend(produced);
+                // Per-task: each signal flows one by one, one LLM turn each.
+                emit.extend(produced.into_iter().map(Emission::Single));
             } else {
-                // Hold until this task's session settles, then flush together —
-                // never drop it (#28).
+                // Hold until this task's session settles, then flush the group
+                // merged as one batch — never drop it (#28).
                 self.held.entry(session).or_default().extend(produced);
             }
         }
@@ -437,7 +449,7 @@ impl Orchestrator {
                         format!("Running for {}s", event.elapsed_secs),
                     );
                     self.signal_window.push(entry.clone());
-                    emit.push(entry);
+                    emit.push(Emission::Single(entry));
                 }
             }
         }
@@ -450,7 +462,7 @@ impl Orchestrator {
     /// Move held fire_wake=false signals into `emit` for every session whose
     /// tasks have all finished (#28). Also called after a kill, since killing a
     /// session's last running task settles it.
-    fn flush_settled_sessions(&mut self, emit: &mut Vec<SignalEntry>) {
+    fn flush_settled_sessions(&mut self, emit: &mut Vec<Emission>) {
         let settled: Vec<Option<String>> = self
             .held
             .keys()
@@ -459,7 +471,10 @@ impl Orchestrator {
             .collect();
         for session in settled {
             if let Some(signals) = self.held.remove(&session) {
-                emit.extend(signals);
+                if !signals.is_empty() {
+                    // One settled fire_wake=false group -> one merged batch.
+                    emit.push(Emission::Batch(signals));
+                }
             }
         }
     }
@@ -498,7 +513,7 @@ impl Orchestrator {
                                     None
                                 }
                             })
-                            .unwrap_or(true);
+                            .unwrap_or(false);
 
                         self.outputs.insert(result.pid, raw.clone());
 
@@ -641,9 +656,20 @@ mod tests {
             .expect("channel has capacity");
     }
 
-    fn exit_pids(signals: &[SignalEntry]) -> Vec<u64> {
-        signals
-            .iter()
+    fn flatten(emissions: &[Emission]) -> Vec<SignalEntry> {
+        let mut out = Vec::new();
+        for e in emissions {
+            match e {
+                Emission::Single(s) => out.push(s.clone()),
+                Emission::Batch(sigs) => out.extend(sigs.iter().cloned()),
+            }
+        }
+        out
+    }
+
+    fn exit_pids(emissions: &[Emission]) -> Vec<u64> {
+        flatten(emissions)
+            .into_iter()
             .filter(|s| s.kind == SignalKind::Exit)
             .map(|s| s.pid)
             .collect()
@@ -659,9 +685,22 @@ mod tests {
         complete_mcp(&orch, 1, "out1");
         assert!(orch.drain_emittable().is_empty());
 
-        // Task 2 finishes: the session settles, so BOTH are flushed together.
+        // Task 2 finishes: the session settles, so BOTH are flushed as ONE
+        // merged batch (not two separate singles).
         complete_mcp(&orch, 2, "out2");
-        assert_eq!(exit_pids(&orch.drain_emittable()), vec![1, 2]);
+        let emissions = orch.drain_emittable();
+        assert_eq!(emissions.len(), 1, "one merged batch, not per-signal");
+        match &emissions[0] {
+            Emission::Batch(sigs) => {
+                let pids: Vec<u64> = sigs
+                    .iter()
+                    .filter(|s| s.kind == SignalKind::Exit)
+                    .map(|s| s.pid)
+                    .collect();
+                assert_eq!(pids, vec![1, 2]);
+            }
+            Emission::Single(_) => panic!("expected a merged Batch"),
+        }
     }
 
     #[tokio::test]
@@ -691,13 +730,19 @@ mod tests {
 
     #[tokio::test]
     async fn fire_wake_true_still_emits_immediately_with_running_sibling() {
-        // A fire_wake=true task is never held, even while a sibling runs.
+        // A fire_wake=true task is never held or merged — it emits as a Single
+        // even while a sibling runs.
         let mut orch = Orchestrator::new();
         insert_running_mcp(&mut orch, 1, Some("goalA"), true);
         insert_running_mcp(&mut orch, 2, Some("goalA"), false);
 
         complete_mcp(&orch, 1, "out1");
-        assert_eq!(exit_pids(&orch.drain_emittable()), vec![1]);
+        let emissions = orch.drain_emittable();
+        assert_eq!(emissions.len(), 1);
+        assert!(
+            matches!(&emissions[0], Emission::Single(s) if s.kind == SignalKind::Exit && s.pid == 1),
+            "fire_wake=true must emit as a Single"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -769,8 +814,8 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let emitted = orch.drain_emittable();
-        // A timer expiry produces a REMIND ("Ns elapsed") and an EXIT.
+        // A timer is fire_wake=true, so its REMIND + EXIT come as Singles.
+        let emitted = flatten(&orch.drain_emittable());
         assert_eq!(emitted.len(), 2);
         assert_eq!(emitted[0].kind, SignalKind::Remind);
         assert_eq!(emitted[1].kind, SignalKind::Exit);
