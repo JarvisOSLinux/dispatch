@@ -3,7 +3,7 @@
 **For:** The dispatch implementation (Rust/Tokio).
 **Context:** JARVIS (the Python client) needs dispatch to support goal deferral — the ability to set a timer that fires a REMIND signal after a duration, without invoking any MCP server.
 
-This document describes what dispatch needs to add. JARVIS will handle goal state, context scoping, and LLM prompt construction on its side once this is implemented.
+**Status: IMPLEMENTED.** The `timer` tool described below is shipped (`src/mcp_server.rs::handle_timer`, `src/orchestrator.rs::dispatch_timer`) with tests in `src/orchestrator.rs`; JARVIS-side goal deferral is implemented in the project-jarvis daemon. This doc is retained as the design record.
 
 ---
 
@@ -26,7 +26,7 @@ Use cases:
 
 ### 1. Timer Tool
 
-Dispatch should expose a `timer` tool alongside its existing `dispatch`, `kill`, `wait`, `status`, and `log` tools.
+Dispatch exposes `timer` alongside its existing `dispatch`, `kill`, `wait`, `status`, `log`, and `get_output` tools (plus the registry/index tools: `browse_servers`, `browse_servers_batch`, `server_count`, `embedding_spec`, `sync_index`, `index_server`).
 
 **Tool name:** `timer`
 
@@ -198,7 +198,7 @@ Instead of a separate `timer` tool, timers could be dispatched through the exist
 }
 ```
 
-This avoids adding a new top-level tool but feels a bit hacky. Either approach works — pick whichever fits the codebase better. The separate `timer` tool is cleaner; the `__timer__` variant is less surface area.
+**Resolved:** the separate `timer` tool was implemented; the `__timer__` dispatch variant was not (passing `server: "__timer__"` to `dispatch` is not special-cased).
 
 ---
 
@@ -210,8 +210,10 @@ For consistency, here are all the signals a timer can produce:
 |--------|------|---------|
 | INIT | Timer created | `{pid, type: "INIT", label, metadata, duration}` |
 | REMIND | Timer expired | `{pid, type: "REMIND", label, metadata, elapsed}` |
-| EXIT | After REMIND fires | `{pid, type: "EXIT", label, output: "timer completed"}` |
-| KILL | Timer cancelled | `{pid, type: "KILL", label}` |
+| EXIT | After REMIND fires | message `"timer completed"`, no structured payload |
+| KILL | Timer cancelled | message `timer "<label>" cancelled`, no structured payload |
+
+Only INIT and REMIND carry structured payloads — `metadata`/`goal_id` must be read from those entries, not from EXIT/KILL.
 
 ---
 
@@ -239,3 +241,7 @@ Suggested test cases:
 | Visible in status | Yes, shows remaining time |
 | MCP server needed | No — pure tokio::time::sleep |
 | Repeating | No — one-shot. Client dispatches new timer if needed |
+
+## Changelog — corrected claims
+
+*2026-07-22:* marked implemented (separate `timer` tool; `__timer__` variant rejected); tool roster updated; EXIT/KILL documented as plain messages without structured payloads.

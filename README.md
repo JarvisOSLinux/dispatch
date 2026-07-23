@@ -82,12 +82,25 @@ Add to your MCP client config (Claude, Cursor, etc.):
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `dispatch` | Dispatch tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?}]` |
+| `dispatch` | Dispatch tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?, fire_wake?, defer_output?}]`, `strategy?: string`, `session_id?: string` |
 | `kill` | Terminate running tasks by PID | `pids: [int]` |
 | `wait` | Acknowledge reminder, keep tasks running | `pids: [int]` |
 | `status` | Get current state of all active tasks | — |
 | `log` | Get the signal window (last N entries) | `count?: int` (default: 20) |
+| `get_output` | Retrieve full output of completed tasks (incl. `defer_output` tasks) | `pids: [int]` |
 | `timer` | Set a one-shot timer that fires a REMIND signal after a duration | `label: string`, `duration: int` (seconds), `metadata?: object` |
+| `browse_servers` | Vector-search the MCP registry (via dmcp index) | `vector`, `top_k`, `min_score` |
+| `browse_servers_batch` | Batch vector search (one call, many queries) | `vectors`, `top_k`, `min_score` |
+| `server_count` | Number of servers in the registry index | — |
+| `embedding_spec` | Embedding model/version the index expects | — |
+| `sync_index` | Sync the local vector index with installed servers | — |
+| `index_server` | Add/update one server in the vector index | `server_id`, `server vector` |
+
+Per-task options: `fire_wake` (default `true` — set `false` to suppress per-task wakeup; a `fire_wake: false` group is coalesced into one batch notification) and `defer_output` (default `false` — store output out-of-band, EXIT shows `200 (deferred)`, fetch with `get_output`). Top-level: `strategy` is persisted and prepended to every wakeup; `session_id` scopes the signal window to this session's PIDs.
+
+### Wakeups
+
+Tool calls are fire-and-return: `dispatch`/`timer` enqueue INIT and return the current signal window plus PIDs immediately. EXIT/REMIND signals are pushed asynchronously as MCP logging notifications (`notifications/message`, logger `dispatch.signal`) — individually for `fire_wake: true` tasks, as one batch for a settled `fire_wake: false` group.
 
 ## Signals
 
@@ -104,8 +117,8 @@ Every event is a signal. The signal window (last 20 entries) is the LLM's workin
 ```
 [14:02:01] PID 1 INIT    git pull origin main
 [14:02:01] PID 2 INIT    browser search "Rust async patterns"
-[14:02:02] PID 1 EXIT    Already up to date.
-[14:02:05] PID 2 EXIT    Found 12 results: ...
+[14:02:02] PID 1 EXIT    [hash=a3f2c1] 200 <a3f2c1>Already up to date.</a3f2c1>
+[14:02:05] PID 2 EXIT    [hash=9b7e04] 200 <9b7e04>Found 12 results: ...</9b7e04>
 ```
 
 ## Timers
@@ -127,8 +140,10 @@ Timers are killable via the `kill` tool and visible in `status` (showing remaini
 |--------|------|---------|
 | `INIT` | Timer created | `{pid, type: "INIT", label, metadata, duration}` |
 | `REMIND` | Timer expired | `{pid, type: "REMIND", label, metadata, elapsed}` |
-| `EXIT` | After REMIND fires | `{pid, type: "EXIT", label, output: "timer completed"}` |
-| `KILL` | Timer cancelled | `{pid, type: "KILL", label}` |
+| `EXIT` | After REMIND fires | message `"timer completed"`, no structured payload |
+| `KILL` | Timer cancelled | message `timer "<label>" cancelled`, no structured payload |
+
+Only INIT and REMIND carry structured payloads — read `metadata` from those entries.
 
 ### Timer example
 
@@ -183,6 +198,7 @@ src/
 ├── reminder.rs      # Timer-based reminder system
 ├── mcp_client.rs    # Client for calling dmcp
 ├── mcp_server.rs    # MCP server interface (JSON-RPC 2.0 over stdio)
+├── nonce.rs         # Output-provenance nonce generation (128-bit boundary tokens)
 └── error.rs         # Error types
 ```
 
@@ -191,3 +207,7 @@ src/
 - [dmcp — MCP server manager](https://github.com/YakupAtahanov/dmcp)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - [Tokio — async runtime for Rust](https://tokio.rs/)
+
+## Changelog — corrected claims
+
+*2026-07-22:* tools table extended from 6 to the full 13 MCP tools with per-task/top-level dispatch options and a Wakeups note (fire-and-return + pushed `dispatch.signal` notifications); EXIT examples updated to the 128-bit nonce boundary format; timer EXIT/KILL documented as plain messages (only INIT/REMIND carry payloads); `nonce.rs` added to the project tree.
