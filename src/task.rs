@@ -32,6 +32,13 @@ pub struct TaskDef {
     /// Use for large payloads where inline content would bloat the signal window.
     #[serde(default)]
     pub defer_output: bool,
+    /// Route this task through a persistent dmcp session when the dispatch call
+    /// also carries a top-level `session_id`: the spawned `dmcp call` gains
+    /// `--session <id>`, so the broker reuses one live in-process server (browser,
+    /// REPL, DB connection) across the goal's calls. Without a session_id it is
+    /// ignored and the task runs one-shot, exactly as before. Default: false.
+    #[serde(default)]
+    pub stateful: bool,
 }
 
 /// A timer definition as received from the LLM.

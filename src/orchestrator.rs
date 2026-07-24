@@ -66,6 +66,12 @@ pub struct Orchestrator {
     /// coalesced batch is delivered as a group instead of dropped (#28). Keyed by
     /// session (None = the no-session group).
     held: HashMap<Option<String>, Vec<SignalEntry>>,
+    /// Sessions that dispatched at least one stateful (`--session`) task. When
+    /// such a session settles (last task done) or is killed, dispatch fires one
+    /// best-effort `dmcp session close` to tear down the broker-held server, then
+    /// drops the id so the close fires exactly once. Sessions with only one-shot
+    /// tasks never appear here, so they trigger no spurious close.
+    stateful_sessions: HashSet<String>,
     /// Notified whenever a background task result or reminder becomes available,
     /// so the serve loop drains and pushes signals to the LLM immediately
     /// instead of waiting for the next request (#26).
@@ -95,6 +101,7 @@ impl Orchestrator {
             pid_to_session: HashMap::new(),
             current_session_id: None,
             held: HashMap::new(),
+            stateful_sessions: HashSet::new(),
             wake,
         }
     }
@@ -132,6 +139,11 @@ impl Orchestrator {
 
             if let Some(ref sid) = session_id {
                 self.pid_to_session.insert(task_pid, sid.clone());
+                // A stateful task with a session runs through the broker, so its
+                // server outlives the client and must be closed on settle/kill.
+                if task.mcp_def().stateful {
+                    self.stateful_sessions.insert(sid.clone());
+                }
             }
 
             self.signal_window.push(SignalEntry::new(
@@ -152,9 +164,18 @@ impl Orchestrator {
             let server = mcp_def.server.clone();
             let tool = mcp_def.tool.clone();
             let params = mcp_def.params.clone();
+            // Only a stateful task carrying a session threads `--session`; a
+            // one-shot task (or a stateful task with no session) is unchanged.
+            let session_for_call = if mcp_def.stateful {
+                session_id.clone()
+            } else {
+                None
+            };
 
             let join_handle = tokio::spawn(async move {
-                let result = DmcpClient::call_tool(&server, &tool, &params).await;
+                let result =
+                    DmcpClient::call_tool(&server, &tool, &params, session_for_call.as_deref())
+                        .await;
                 let output = match result {
                     Ok(stdout) => Ok(stdout),
                     Err(e) => Err(format!("Error: {}", e)),
@@ -254,9 +275,13 @@ impl Orchestrator {
             killed.push(task_pid);
         }
 
-        // Killing a session's last running task settles it, so wake the serve
-        // loop to flush any held fire_wake=false signals for that session (#28).
+        // Killing a session's last running task settles it. The process-group
+        // kill above only reaps the thin dmcp client, so a stateful session's
+        // broker-held server survives — tear it down explicitly here (#36).
         if !killed.is_empty() {
+            self.close_settled_stateful_sessions();
+            // Wake the serve loop to flush any held fire_wake=false signals for a
+            // now-settled session (#28).
             self.wake.notify_one();
         }
 
@@ -479,6 +504,32 @@ impl Orchestrator {
         }
     }
 
+    /// Collect every tracked stateful session that has now settled (no task of
+    /// it still running), drop each from tracking, and return their ids. Split
+    /// from the spawn so settle detection is unit-testable without a dmcp binary.
+    fn take_settled_stateful_sessions(&mut self) -> Vec<String> {
+        let settled: Vec<String> = self
+            .stateful_sessions
+            .iter()
+            .filter(|sid| !self.session_has_running(Some(sid.as_str())))
+            .cloned()
+            .collect();
+        for sid in &settled {
+            self.stateful_sessions.remove(sid);
+        }
+        settled
+    }
+
+    /// Fire a best-effort `dmcp session close` for each stateful session that
+    /// has settled. The broker-held server survives the thin client's
+    /// process-group teardown, so this explicit close is the real teardown; the
+    /// spawn is fire-and-forget and never blocks the event loop (#36).
+    fn close_settled_stateful_sessions(&mut self) {
+        for sid in self.take_settled_stateful_sessions() {
+            DmcpClient::spawn_session_close(&sid);
+        }
+    }
+
     /// Render the current signal window for the request path without draining —
     /// completed results are folded in and pushed by the serve loop's wake path
     /// (`drain_emittable`), so `dispatch`/`timer` must not block or steal them
@@ -582,6 +633,10 @@ impl Orchestrator {
             task.mark_exited();
         }
 
+        // A stateful session whose last task just finished must have its
+        // broker-held server torn down (best-effort, fire-and-forget) (#36).
+        self.close_settled_stateful_sessions();
+
         produced
     }
 
@@ -640,11 +695,30 @@ mod tests {
             remind_after: None,
             fire_wake,
             defer_output: false,
+            stateful: false,
         };
         orch.tasks.insert(pid, Task::new_mcp(pid, def));
         if let Some(sid) = session {
             orch.pid_to_session.insert(pid, sid.to_string());
         }
+    }
+
+    /// Inject a running stateful task bound to `session`, mirroring what
+    /// `dispatch` records for a stateful task carrying a session_id (both the
+    /// pid→session map and the stateful-session set), without spawning dmcp.
+    fn insert_running_stateful_mcp(orch: &mut Orchestrator, pid: u64, session: &str) {
+        let def = TaskDef {
+            server: "s".into(),
+            tool: "t".into(),
+            params: json!({}),
+            remind_after: None,
+            fire_wake: true,
+            defer_output: false,
+            stateful: true,
+        };
+        orch.tasks.insert(pid, Task::new_mcp(pid, def));
+        orch.pid_to_session.insert(pid, session.to_string());
+        orch.stateful_sessions.insert(session.to_string());
     }
 
     fn complete_mcp(orch: &Orchestrator, pid: u64, output: &str) {
@@ -941,5 +1015,73 @@ mod tests {
         let pids_b = orch.session_pids("goal_b");
         assert!(pids_b.contains(&3));
         assert!(!pids_b.contains(&1));
+    }
+
+    // -- stateful session teardown (#36) -----------------------------------
+
+    #[test]
+    fn settled_stateful_session_is_closed_exactly_once() {
+        let mut orch = Orchestrator::new();
+        insert_running_stateful_mcp(&mut orch, 1, "goalA");
+        // Still running: not settled, no close.
+        assert!(orch.take_settled_stateful_sessions().is_empty());
+
+        orch.tasks.get_mut(&1).unwrap().mark_exited();
+        // Settled: the session is returned once and dropped from tracking.
+        assert_eq!(
+            orch.take_settled_stateful_sessions(),
+            vec!["goalA".to_string()]
+        );
+        // Fires exactly once — a second sweep yields nothing.
+        assert!(orch.take_settled_stateful_sessions().is_empty());
+        assert!(!orch.stateful_sessions.contains("goalA"));
+    }
+
+    #[test]
+    fn settled_session_without_stateful_task_fires_no_close() {
+        // A one-shot-only session never enters stateful_sessions, so settling it
+        // triggers no spurious close.
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, Some("goalA"), true);
+        orch.tasks.get_mut(&1).unwrap().mark_exited();
+        assert!(orch.take_settled_stateful_sessions().is_empty());
+    }
+
+    #[test]
+    fn stateful_session_stays_open_until_all_its_tasks_finish() {
+        let mut orch = Orchestrator::new();
+        insert_running_stateful_mcp(&mut orch, 1, "goalA");
+        insert_running_stateful_mcp(&mut orch, 2, "goalA");
+
+        orch.tasks.get_mut(&1).unwrap().mark_exited();
+        // Task 2 still runs: the session is not yet settled.
+        assert!(orch.take_settled_stateful_sessions().is_empty());
+
+        orch.tasks.get_mut(&2).unwrap().mark_exited();
+        assert_eq!(
+            orch.take_settled_stateful_sessions(),
+            vec!["goalA".to_string()]
+        );
+    }
+
+    #[test]
+    fn kill_stateful_task_closes_its_session() {
+        // Runs without a Tokio runtime: spawn_session_close is a no-op here, but
+        // the close decision still runs and drops the session from tracking.
+        let mut orch = Orchestrator::new();
+        insert_running_stateful_mcp(&mut orch, 1, "goalA");
+        orch.kill(&[1]).expect("kill succeeds");
+        assert!(!orch.stateful_sessions.contains("goalA"));
+    }
+
+    #[test]
+    fn kill_one_of_several_stateful_tasks_keeps_session_open() {
+        // Killing one task while a sibling still runs must not tear down the
+        // shared broker server the sibling depends on.
+        let mut orch = Orchestrator::new();
+        insert_running_stateful_mcp(&mut orch, 1, "goalA");
+        insert_running_stateful_mcp(&mut orch, 2, "goalA");
+        orch.kill(&[1]).expect("kill succeeds");
+        assert!(orch.stateful_sessions.contains("goalA"));
     }
 }
