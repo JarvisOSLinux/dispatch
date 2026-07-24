@@ -94,6 +94,10 @@ fn tool_definitions() -> Value {
                                 "defer_output": {
                                     "type": "boolean",
                                     "description": "If true, store output out-of-band and show only '[hash=h] 200 (deferred)' in the EXIT signal. Use for large payloads to keep the signal window compact. Default: false (output inlined as '[hash=h] 200 <h>output</h>')."
+                                },
+                                "stateful": {
+                                    "type": "boolean",
+                                    "description": "Default: false. Set true for servers that hold state in-process across calls (browser, REPL, DB connection). When the dispatch call also carries a top-level session_id, this task runs through a persistent dmcp session (--session), reusing one live server for the whole goal instead of a fresh one-shot process; the session is torn down when the goal settles or its tasks are killed. Ignored (one-shot, unchanged) when no session_id is provided."
                                 }
                             },
                             "required": ["server", "tool"]

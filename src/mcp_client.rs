@@ -128,20 +128,47 @@ impl DmcpClient {
         Ok(())
     }
 
-    /// Call a tool on an MCP server via `dmcp call <server> <tool> --args <json>`.
-    /// Returns the stdout output as a string.
+    /// Argv (after the program name) for a `dmcp call`. A stateful task carrying
+    /// a session gets `--session <id>` appended so the broker reuses one live
+    /// server; without a session it is the byte-for-byte one-shot argv. Factored
+    /// out so the session threading is unit-testable without spawning dmcp.
+    fn call_args(
+        server: &str,
+        tool: &str,
+        params: &serde_json::Value,
+        session: Option<&str>,
+    ) -> Vec<String> {
+        let mut args = vec!["call".to_string(), server.to_string(), tool.to_string()];
+        if !params.is_null() && params != &serde_json::json!({}) {
+            args.push("--args".to_string());
+            args.push(params.to_string());
+        }
+        if let Some(sid) = session {
+            args.push("--session".to_string());
+            args.push(sid.to_string());
+        }
+        args
+    }
+
+    /// Call a tool on an MCP server via `dmcp call <server> <tool> --args <json>`,
+    /// optionally threading `--session <id>` for a stateful task. Returns the
+    /// stdout output as a string.
     ///
     /// The child is spawned in its own process group with kill-on-drop, so if
     /// the orchestrator aborts this task (the `kill` tool), dropping this future
     /// tears down the whole dmcp → MCP-server tree instead of leaving it running.
-    pub async fn call_tool(server: &str, tool: &str, params: &serde_json::Value) -> Result<String> {
+    /// For a `--session` task the process-group kill only reaps the thin dmcp
+    /// client — the broker-held server survives, so the session is torn down
+    /// explicitly via `session_close` on settle/kill.
+    pub async fn call_tool(
+        server: &str,
+        tool: &str,
+        params: &serde_json::Value,
+        session: Option<&str>,
+    ) -> Result<String> {
         debug!(server, tool, "calling dmcp tool");
         let mut cmd = Command::new("dmcp");
-        cmd.arg("call").arg(server).arg(tool);
-
-        if !params.is_null() && params != &serde_json::json!({}) {
-            cmd.arg("--args").arg(params.to_string());
-        }
+        cmd.args(Self::call_args(server, tool, params, session));
 
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -386,5 +413,134 @@ impl DmcpClient {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(DispatchError::DmcpError(stderr.trim().to_string()))
         }
+    }
+
+    /// Program used to spawn dmcp subcommands. Defaults to `dmcp` on PATH;
+    /// overridable via `DMCP_BIN` so a test can point the session-close spawn at
+    /// a stub rather than a real dmcp binary.
+    fn dmcp_bin() -> String {
+        std::env::var("DMCP_BIN").unwrap_or_else(|_| "dmcp".to_string())
+    }
+
+    /// Argv (after the program name) for `dmcp session close <session_id>`.
+    /// Factored out so the teardown command is assertable without spawning dmcp.
+    fn session_close_args(session_id: &str) -> Vec<String> {
+        vec![
+            "session".to_string(),
+            "close".to_string(),
+            session_id.to_string(),
+        ]
+    }
+
+    /// Fire `dmcp session close <session_id>` and await its exit. Idempotent on
+    /// the dmcp side (exit 0 even if nothing was open). Used to tear down a
+    /// broker-held stateful server, which survives the thin client's
+    /// process-group kill.
+    async fn session_close(session_id: &str) -> Result<()> {
+        let output = Command::new(Self::dmcp_bin())
+            .args(Self::session_close_args(session_id))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e)))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(DispatchError::DmcpError(stderr.trim().to_string()))
+        }
+    }
+
+    /// Best-effort, fire-and-forget `dmcp session close <session_id>`: spawn it
+    /// onto the current runtime and return immediately, never blocking the
+    /// orchestrator's event loop. Failures are logged, not propagated — the
+    /// broker's idle TTL is the backstop. A no-op when called outside a Tokio
+    /// runtime (e.g. a synchronous unit test), so it never panics.
+    pub fn spawn_session_close(session_id: &str) {
+        let sid = session_id.to_string();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = Self::session_close(&sid).await {
+                        warn!(session = %sid, error = %e, "dmcp session close failed");
+                    } else {
+                        debug!(session = %sid, "dmcp session closed");
+                    }
+                });
+            }
+            Err(_) => {
+                debug!(session = %sid, "no Tokio runtime; skipping session close spawn");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn as_strs(args: &[String]) -> Vec<&str> {
+        args.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn call_args_one_shot_has_no_session_flag() {
+        let args = DmcpClient::call_args("srv", "tool", &json!({"a": 1}), None);
+        assert_eq!(
+            as_strs(&args),
+            vec!["call", "srv", "tool", "--args", "{\"a\":1}"]
+        );
+        assert!(!args.iter().any(|a| a == "--session"));
+    }
+
+    #[test]
+    fn call_args_stateful_without_session_is_one_shot() {
+        // stateful is a task property; the argv only gains --session when the
+        // caller passes one. No session => unchanged one-shot argv.
+        let args = DmcpClient::call_args("srv", "tool", &json!({"a": 1}), None);
+        assert_eq!(
+            as_strs(&args),
+            vec!["call", "srv", "tool", "--args", "{\"a\":1}"]
+        );
+    }
+
+    #[test]
+    fn call_args_session_appended_after_args() {
+        let args = DmcpClient::call_args("srv", "tool", &json!({"k": "v"}), Some("goal-1"));
+        assert_eq!(
+            as_strs(&args),
+            vec![
+                "call",
+                "srv",
+                "tool",
+                "--args",
+                "{\"k\":\"v\"}",
+                "--session",
+                "goal-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn call_args_session_with_empty_params_omits_args_flag() {
+        // Empty params are omitted exactly as the one-shot path does, but the
+        // session flag is still threaded through.
+        let args = DmcpClient::call_args("srv", "tool", &json!({}), Some("goal-1"));
+        assert_eq!(
+            as_strs(&args),
+            vec!["call", "srv", "tool", "--session", "goal-1"]
+        );
+    }
+
+    #[test]
+    fn session_close_args_shape() {
+        assert_eq!(
+            as_strs(&DmcpClient::session_close_args("goal-9")),
+            vec!["session", "close", "goal-9"]
+        );
     }
 }
