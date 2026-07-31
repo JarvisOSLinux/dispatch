@@ -489,9 +489,10 @@ impl DmcpClient {
     /// Call a tool with `dmcp call --session <sid> --interactive`, relaying any
     /// question the server asks to `prompts` and feeding the answer back.
     ///
-    /// Only a session task can take this path: elicitation needs the server to
-    /// stay alive across the exchange, which is exactly what a session is, and
-    /// dmcp itself refuses `--interactive` without `--session`.
+    /// Used for every MCP call. `session` is `Some` only for a stateful task;
+    /// `--interactive` is always passed, because a plain one-shot command can
+    /// elicit too (a system-scope `pacman -Syu`), and dmcp's tagged stream is a
+    /// superset — a server that never asks just yields its result.
     ///
     /// In this mode every dmcp stdout line is a tagged JSON object, so the
     /// stream is parsed rather than trimmed. A line that cannot be parsed, or a
@@ -501,13 +502,16 @@ impl DmcpClient {
         server: &str,
         tool: &str,
         params: &serde_json::Value,
-        session: &str,
+        session: Option<&str>,
         prompts: mpsc::Sender<PendingPrompt>,
     ) -> Result<String> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        debug!(server, tool, session, "calling dmcp tool (interactive)");
-        let mut args = Self::call_args(server, tool, params, Some(session));
+        debug!(server, tool, ?session, "calling dmcp tool (interactive)");
+        // --session only when the task is stateful; --interactive always, so a
+        // one-shot command that elicits (a system-scope `pacman -Syu`) is still
+        // answered. dmcp gates system scope + session out on its own.
+        let mut args = Self::call_args(server, tool, params, session);
         args.push("--interactive".to_string());
 
         let mut cmd = Command::new(Self::dmcp_bin());

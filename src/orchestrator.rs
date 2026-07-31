@@ -174,8 +174,14 @@ impl Orchestrator {
             let server = mcp_def.server.clone();
             let tool = mcp_def.tool.clone();
             let params = mcp_def.params.clone();
-            // Only a stateful task carrying a session threads `--session`; a
-            // one-shot task (or a stateful task with no session) is unchanged.
+            // A stateful task threads `--session` so its server persists across
+            // calls; a one-shot task passes none. Either way the call goes
+            // through the interactive driver, because whether a server will ask
+            // a question is not knowable from here — a system-scope command like
+            // `pacman -Syu` elicits from a plain one-shot task, no session
+            // involved. dmcp's interactive stream is a superset: a server that
+            // never asks just yields its result, so this costs nothing for the
+            // tools that do not need it.
             let session_for_call = if mcp_def.stateful {
                 session_id.clone()
             } else {
@@ -183,37 +189,33 @@ impl Orchestrator {
             };
 
             let join_handle = tokio::spawn(async move {
-                // A session task keeps its server alive, which is the one shape
-                // that can hold a question open, so it takes the interactive
-                // path. Everything else calls exactly as before.
-                let result = match session_for_call.as_deref() {
-                    Some(sid) => {
-                        let (ptx, mut prx) = mpsc::channel::<crate::mcp_client::PendingPrompt>(1);
-                        let call =
-                            DmcpClient::call_tool_interactive(&server, &tool, &params, sid, ptx);
-                        tokio::pin!(call);
-                        loop {
-                            // The server is blocked until its question is
-                            // answered, so prompts must be pumped WHILE the call
-                            // runs; awaiting the call first would deadlock
-                            // against the answer needed to finish it. Biased so
-                            // a finished call beats a late prompt.
-                            tokio::select! {
-                                biased;
-                                r = &mut call => break r,
-                                Some((prompt, answer)) = prx.recv() => {
-                                    let _ = tx
-                                        .send(TaskResult {
-                                            pid: task_pid,
-                                            kind: TaskResultKind::NeedsAction { prompt, answer },
-                                        })
-                                        .await;
-                                    wake.notify_one();
-                                }
-                            }
+                let (ptx, mut prx) = mpsc::channel::<crate::mcp_client::PendingPrompt>(1);
+                let call = DmcpClient::call_tool_interactive(
+                    &server,
+                    &tool,
+                    &params,
+                    session_for_call.as_deref(),
+                    ptx,
+                );
+                tokio::pin!(call);
+                let result = loop {
+                    // The server is blocked until its question is answered, so
+                    // prompts must be pumped WHILE the call runs; awaiting the
+                    // call first would deadlock against the answer needed to
+                    // finish it. Biased so a finished call beats a late prompt.
+                    tokio::select! {
+                        biased;
+                        r = &mut call => break r,
+                        Some((prompt, answer)) = prx.recv() => {
+                            let _ = tx
+                                .send(TaskResult {
+                                    pid: task_pid,
+                                    kind: TaskResultKind::NeedsAction { prompt, answer },
+                                })
+                                .await;
+                            wake.notify_one();
                         }
                     }
-                    None => DmcpClient::call_tool(&server, &tool, &params, None).await,
                 };
                 let output = match result {
                     Ok(stdout) => Ok(stdout),
