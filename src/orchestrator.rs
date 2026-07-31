@@ -649,7 +649,7 @@ impl Orchestrator {
                 // The question is attributed to the server that asked it. The
                 // text is that server's, not ours, and a community server could
                 // phish through it — so it is never phrased as JARVIS asking.
-                self.signal_window.push(SignalEntry::with_payload(
+                let entry = SignalEntry::with_payload(
                     result.pid,
                     SignalKind::NeedsAction,
                     format!("server '{}' asks: {}", server, message),
@@ -662,8 +662,17 @@ impl Orchestrator {
                         "url": prompt.get("url"),
                         "untrusted": true,
                     }),
-                ));
-                return Vec::new();
+                );
+                self.signal_window.push(entry.clone());
+                // Return it, exactly as an EXIT is returned. Two consumers race
+                // for every task result: `wait_for_event` (a blocking dispatch /
+                // wait call) and `drain_emittable` (the serve loop's proactive
+                // push). Whichever wins must still get the question to the LLM.
+                // Returning nothing left the signal sitting in the window with
+                // nobody told, so the parked task waited forever for an answer
+                // the model was never asked to give.
+                produced.push(entry);
+                return produced;
             }
             TaskResultKind::McpComplete(output) => {
                 let exit_entry = match output {
@@ -1245,6 +1254,49 @@ mod needs_action_tests {
             stateful: true,
         };
         orch.dispatch(vec![def], None, Some("S1".to_string()))[0]
+    }
+
+    /// The question must be EMITTED, not merely recorded. Two consumers race for
+    /// every task result — `wait_for_event` (a blocking dispatch/wait call) and
+    /// `drain_emittable` (the serve loop's proactive push) — and the emitting one
+    /// forwards only what `handle_task_result` returns. Returning nothing left
+    /// the signal in the window with nobody told, so the parked task waited
+    /// forever for an answer the LLM was never asked to give. Caught only by
+    /// driving the real binaries end to end; mocked unit tests cannot see it.
+    #[tokio::test]
+    async fn a_parked_task_emits_its_question_for_the_llm() {
+        let mut orch = Orchestrator::new();
+        let pid = dispatch_one(&mut orch);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let produced = orch.handle_task_result(TaskResult {
+            pid,
+            kind: TaskResultKind::NeedsAction {
+                prompt: json!({"server": "com.test.installer", "message": "Proceed? [Y/n]"}),
+                answer: tx,
+            },
+        });
+        assert_eq!(
+            produced.len(),
+            1,
+            "the question must be returned for emission, not only stashed in the window"
+        );
+        assert_eq!(produced[0].kind, SignalKind::NeedsAction);
+        assert_eq!(produced[0].pid, pid);
+    }
+
+    /// The same entry also lands in the window, so a later `log` call shows it.
+    #[tokio::test]
+    async fn the_emitted_question_is_also_recorded_in_the_window() {
+        let mut orch = Orchestrator::new();
+        let pid = dispatch_one(&mut orch);
+        let _rx = park(&mut orch, pid);
+        let log = orch.log_json(10);
+        let found = log
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|e| e.get("kind").and_then(|k| k.as_str()) == Some("NEEDS_ACTION"));
+        assert!(found, "the question must be in the signal window too");
     }
 
     /// A parked task is alive, not finished: it keeps its slot, produces no
