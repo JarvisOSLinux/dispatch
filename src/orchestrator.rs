@@ -12,7 +12,7 @@ use crate::mcp_client::DmcpClient;
 use crate::pid;
 use crate::reminder::{ReminderEvent, ReminderManager};
 use crate::signal::{SignalEntry, SignalKind, SignalWindow};
-use crate::task::{Task, TaskDef, TaskKind, TaskState, TaskStatus, TimerDef};
+use crate::task::{Task, TaskDef, TaskKind, TaskStatus, TimerDef};
 
 const DEFAULT_WINDOW_SIZE: usize = 20;
 const REMINDER_CHANNEL_SIZE: usize = 64;
@@ -24,6 +24,12 @@ struct TaskResult {
 }
 
 enum TaskResultKind {
+    /// The task's server asked a question and is blocked on the answer. Not a
+    /// completion — the task keeps its process and its slot.
+    NeedsAction {
+        prompt: serde_json::Value,
+        answer: tokio::sync::oneshot::Sender<serde_json::Value>,
+    },
     McpComplete(std::result::Result<String, String>),
     TimerExpired {
         label: String,
@@ -53,6 +59,9 @@ pub struct Orchestrator {
     task_result_tx: mpsc::Sender<TaskResult>,
     /// Output store for completed MCP tasks.
     outputs: HashMap<u64, String>,
+    /// Answer channels for tasks parked on a question, keyed by PID. A task is
+    /// in here exactly while it is `Waiting`; `respond` takes its sender.
+    pending_answers: HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>,
     /// Current goal strategy set by the LLM via the dispatch tool's `strategy` field.
     strategy: Option<String>,
     /// Maps each dispatched PID to the session_id it belongs to.
@@ -97,6 +106,7 @@ impl Orchestrator {
             task_result_rx,
             task_result_tx,
             outputs: HashMap::new(),
+            pending_answers: HashMap::new(),
             strategy: None,
             pid_to_session: HashMap::new(),
             current_session_id: None,
@@ -173,9 +183,38 @@ impl Orchestrator {
             };
 
             let join_handle = tokio::spawn(async move {
-                let result =
-                    DmcpClient::call_tool(&server, &tool, &params, session_for_call.as_deref())
-                        .await;
+                // A session task keeps its server alive, which is the one shape
+                // that can hold a question open, so it takes the interactive
+                // path. Everything else calls exactly as before.
+                let result = match session_for_call.as_deref() {
+                    Some(sid) => {
+                        let (ptx, mut prx) = mpsc::channel::<crate::mcp_client::PendingPrompt>(1);
+                        let call =
+                            DmcpClient::call_tool_interactive(&server, &tool, &params, sid, ptx);
+                        tokio::pin!(call);
+                        loop {
+                            // The server is blocked until its question is
+                            // answered, so prompts must be pumped WHILE the call
+                            // runs; awaiting the call first would deadlock
+                            // against the answer needed to finish it. Biased so
+                            // a finished call beats a late prompt.
+                            tokio::select! {
+                                biased;
+                                r = &mut call => break r,
+                                Some((prompt, answer)) = prx.recv() => {
+                                    let _ = tx
+                                        .send(TaskResult {
+                                            pid: task_pid,
+                                            kind: TaskResultKind::NeedsAction { prompt, answer },
+                                        })
+                                        .await;
+                                    wake.notify_one();
+                                }
+                            }
+                        }
+                    }
+                    None => DmcpClient::call_tool(&server, &tool, &params, None).await,
+                };
                 let output = match result {
                     Ok(stdout) => Ok(stdout),
                     Err(e) => Err(format!("Error: {}", e)),
@@ -333,8 +372,46 @@ impl Orchestrator {
         self.signal_window.to_json(count)
     }
 
+    /// Answer the question a parked task is waiting on, resuming it.
+    ///
+    /// Returns an error string the caller can surface verbatim rather than
+    /// panicking on a stale PID: by the time an answer arrives the task may have
+    /// been killed, or answered already, and neither is a crash.
+    ///
+    /// Nothing here judges the answer — whether an LLM may give it at all, and
+    /// whether a credential-shaped question must go to a human instead, is the
+    /// daemon's call under CONFIRMATION_MODE. dispatch only carries it.
+    pub fn respond(
+        &mut self,
+        pid: u64,
+        answer: serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        let Some(sender) = self.pending_answers.remove(&pid) else {
+            return Err(format!("PID {} is not waiting for an answer", pid));
+        };
+        if let Some(task) = self.tasks.get_mut(&pid) {
+            task.mark_resumed();
+        }
+        sender
+            .send(answer)
+            .map_err(|_| format!("PID {} stopped waiting before the answer arrived", pid))?;
+        self.signal_window.push(SignalEntry::new(
+            pid,
+            SignalKind::Wait,
+            "answered; task resumed",
+        ));
+        Ok(())
+    }
+
+    /// PIDs currently parked on a question.
+    pub fn waiting_pids(&self) -> Vec<u64> {
+        let mut pids: Vec<u64> = self.pending_answers.keys().copied().collect();
+        pids.sort_unstable();
+        pids
+    }
+
     pub fn has_running_tasks(&self) -> bool {
-        self.tasks.values().any(|t| t.state == TaskState::Running)
+        self.tasks.values().any(|t| t.is_running())
     }
 
     /// All PIDs belonging to a given session.
@@ -352,8 +429,7 @@ impl Orchestrator {
     /// another concurrent goal (#28, #142).
     fn session_has_running(&self, session: Option<&str>) -> bool {
         self.tasks.values().any(|t| {
-            t.state == TaskState::Running
-                && self.pid_to_session.get(&t.pid).map(|s| s.as_str()) == session
+            t.is_running() && self.pid_to_session.get(&t.pid).map(|s| s.as_str()) == session
         })
     }
 
@@ -544,6 +620,49 @@ impl Orchestrator {
         let mut produced = Vec::new();
 
         match result.kind {
+            // A parked task is still alive: no reaping, no output, no EXIT.
+            // Register the answer channel, mark the task Waiting, and surface
+            // the question so someone can act on it.
+            TaskResultKind::NeedsAction { prompt, answer } => {
+                if let Some(task) = self.tasks.get_mut(&result.pid) {
+                    task.mark_waiting();
+                } else {
+                    // The task went away between asking and now; declining
+                    // unblocks the server rather than stranding it.
+                    let _ = answer.send(serde_json::json!({"action": "decline"}));
+                    return Vec::new();
+                }
+                self.pending_answers.insert(result.pid, answer);
+
+                let server = prompt
+                    .get("server")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let message = prompt
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                // The question is attributed to the server that asked it. The
+                // text is that server's, not ours, and a community server could
+                // phish through it — so it is never phrased as JARVIS asking.
+                self.signal_window.push(SignalEntry::with_payload(
+                    result.pid,
+                    SignalKind::NeedsAction,
+                    format!("server '{}' asks: {}", server, message),
+                    json!({
+                        "pid": result.pid,
+                        "type": "NEEDS_ACTION",
+                        "server": server,
+                        "message": message,
+                        "schema": prompt.get("schema"),
+                        "url": prompt.get("url"),
+                        "untrusted": true,
+                    }),
+                ));
+                return Vec::new();
+            }
             TaskResultKind::McpComplete(output) => {
                 let exit_entry = match output {
                     Ok(out) => {
@@ -670,6 +789,7 @@ impl Drop for Orchestrator {
 mod tests {
     use super::*;
     use crate::signal::SignalKind;
+    use crate::task::TaskState;
     use crate::task::TimerDef;
 
     fn timer_def(label: &str, duration: u64, metadata: Option<serde_json::Value>) -> TimerDef {
@@ -1083,5 +1203,164 @@ mod tests {
         insert_running_stateful_mcp(&mut orch, 2, "goalA");
         orch.kill(&[1]).expect("kill succeeds");
         assert!(orch.stateful_sessions.contains("goalA"));
+    }
+}
+
+#[cfg(test)]
+mod needs_action_tests {
+    use super::*;
+    use crate::task::TaskState;
+
+    /// Drive a task into the parked state the way the spawn does, and hand back
+    /// the receiver standing in for the blocked server.
+    fn park(
+        orch: &mut Orchestrator,
+        pid: u64,
+    ) -> tokio::sync::oneshot::Receiver<serde_json::Value> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        orch.handle_task_result(TaskResult {
+            pid,
+            kind: TaskResultKind::NeedsAction {
+                prompt: json!({
+                    "server": "com.test.installer",
+                    "message": "Partition type?",
+                    "schema": {"type": "object"},
+                }),
+                answer: tx,
+            },
+        });
+        rx
+    }
+
+    fn dispatch_one(orch: &mut Orchestrator) -> u64 {
+        let def = TaskDef {
+            server: "com.test.srv".to_string(),
+            tool: "ask".to_string(),
+            params: json!({}),
+            remind_after: None,
+            fire_wake: true,
+            defer_output: false,
+            stateful: true,
+        };
+        orch.dispatch(vec![def], None, Some("S1".to_string()))[0]
+    }
+
+    /// A parked task is alive, not finished: it keeps its slot, produces no
+    /// output, and emits NEEDS_ACTION rather than EXIT.
+    #[tokio::test]
+    async fn a_parked_task_is_waiting_not_exited() {
+        let mut orch = Orchestrator::new();
+        let pid = dispatch_one(&mut orch);
+        let _rx = park(&mut orch, pid);
+
+        assert_eq!(orch.tasks.get(&pid).unwrap().state, TaskState::Waiting);
+        assert!(
+            !orch.outputs.contains_key(&pid),
+            "a parked task has no output yet"
+        );
+        assert_eq!(orch.waiting_pids(), vec![pid]);
+        let log = orch.log_json(10);
+        let entries = log.as_array().expect("log is an array");
+        let kinds: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e.get("kind").and_then(|k| k.as_str()))
+            .collect();
+        assert!(kinds.contains(&"NEEDS_ACTION"), "got {:?}", kinds);
+        assert!(
+            !kinds.contains(&"EXIT"),
+            "a parked task must not report EXIT"
+        );
+    }
+
+    /// A parked task still counts as outstanding — otherwise its session would
+    /// settle and its server be torn down while the work is unfinished.
+    #[tokio::test]
+    async fn a_parked_task_keeps_its_session_from_settling() {
+        let mut orch = Orchestrator::new();
+        let pid = dispatch_one(&mut orch);
+        let _rx = park(&mut orch, pid);
+
+        assert!(
+            orch.has_running_tasks(),
+            "a parked task is still running work"
+        );
+        assert!(
+            orch.take_settled_stateful_sessions().is_empty(),
+            "the session must not settle while a task is parked on a question"
+        );
+    }
+
+    /// The answer reaches the blocked server verbatim and the task resumes.
+    #[tokio::test]
+    async fn answering_resumes_the_task_and_delivers_the_content() {
+        let mut orch = Orchestrator::new();
+        let pid = dispatch_one(&mut orch);
+        let rx = park(&mut orch, pid);
+
+        orch.respond(
+            pid,
+            json!({"action": "accept", "content": {"choice": "primary"}}),
+        )
+        .expect("respond");
+
+        assert_eq!(orch.tasks.get(&pid).unwrap().state, TaskState::Running);
+        assert!(orch.waiting_pids().is_empty());
+        let delivered = rx.await.expect("the server receives the answer");
+        assert_eq!(delivered["action"], "accept");
+        assert_eq!(delivered["content"]["choice"], "primary");
+    }
+
+    /// Answering a PID that is not parked is a reported error, not a panic: by
+    /// the time an answer arrives the task may have been killed or answered.
+    #[tokio::test]
+    async fn answering_an_unparked_pid_is_reported_not_fatal() {
+        let mut orch = Orchestrator::new();
+        let err = orch.respond(999, json!({"action": "decline"})).unwrap_err();
+        assert!(
+            err.contains("999"),
+            "the error should name the PID: {}",
+            err
+        );
+
+        let pid = dispatch_one(&mut orch);
+        let _rx = park(&mut orch, pid);
+        orch.respond(pid, json!({"action": "decline"}))
+            .expect("first answer");
+        // Only one answer per question — the second finds nothing waiting.
+        assert!(orch.respond(pid, json!({"action": "decline"})).is_err());
+    }
+
+    /// A question for a task that has already gone is declined rather than
+    /// dropped, so the server unblocks instead of waiting on nobody.
+    #[tokio::test]
+    async fn a_question_for_a_vanished_task_is_declined() {
+        let mut orch = Orchestrator::new();
+        let rx = park(&mut orch, 4242);
+        let delivered = rx.await.expect("an answer is still sent");
+        assert_eq!(delivered["action"], "decline");
+        assert!(orch.waiting_pids().is_empty());
+    }
+
+    /// The signal attributes the question to the server that asked and marks it
+    /// untrusted — a community server could phish through this text, so it must
+    /// never read as JARVIS asking.
+    #[tokio::test]
+    async fn the_signal_attributes_the_question_to_its_server() {
+        let mut orch = Orchestrator::new();
+        let pid = dispatch_one(&mut orch);
+        let _rx = park(&mut orch, pid);
+
+        let log = orch.log_json(10);
+        let entry = log
+            .as_array()
+            .expect("log is an array")
+            .iter()
+            .find(|e| e.get("kind").and_then(|k| k.as_str()) == Some("NEEDS_ACTION"))
+            .expect("a NEEDS_ACTION entry");
+        let msg = entry.get("message").and_then(|m| m.as_str()).unwrap();
+        assert!(msg.contains("com.test.installer"), "got: {}", msg);
+        let payload = entry.get("payload").expect("payload");
+        assert_eq!(payload["server"], "com.test.installer");
+        assert_eq!(payload["untrusted"], true);
     }
 }

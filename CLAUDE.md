@@ -58,6 +58,7 @@ src/
 | Tool | Purpose |
 |------|---------|
 | `dispatch` | Dispatch a list of tasks for concurrent execution (per-task `remind_after`/`fire_wake`/`defer_output`; top-level `strategy`/`session_id`) |
+| `respond` | Answer a question a task's server asked (accept/decline/cancel), resuming a parked task |
 | `kill` | Terminate running tasks by PID |
 | `wait` | Acknowledge reminder, keep task running |
 | `status` | Get current state of all active tasks |
@@ -80,6 +81,44 @@ src/
 | `REMIND` | Task running beyond timeout |
 | `WAIT` | LLM acknowledged reminder |
 | `KILL` | Task terminated |
+| `NEEDS_ACTION` | A task's server asked for input mid-call; the task is parked, alive, awaiting `respond` |
+
+### Mid-execution interaction (NEEDS_ACTION)
+
+Some tools cannot go quiet and cannot be answered up front — `fdisk`,
+`mysql_secure_installation`, a REPL — because they ask a **sequence** of
+questions that only appears as the work unfolds. MCP's `elicitation/create`
+carries these: the tool call does not return while a question is outstanding, so
+the server stays alive and blocked.
+
+A **session task** (stateful + `session_id`) therefore runs through
+`dmcp call --session <sid> --interactive`, whose stdout is a tagged JSON stream.
+`DmcpClient::call_tool_interactive` parses it, relays each `prompt` to the
+orchestrator, and writes the answer back on dmcp's stdin. Non-session tasks call
+exactly as before.
+
+The task then enters **`TaskState::Waiting`** and a `NEEDS_ACTION` signal is
+emitted. `Waiting` is a phase of running, not an end state: `Task::is_running`
+counts it, so a parked task is never reaped, produces no output, emits no EXIT,
+and **holds its session open** — settling it would tear down the very server that
+is waiting to be answered. `respond` (pid + accept/decline/cancel + content)
+delivers the answer and returns the task to `Running`.
+
+The prompt pump runs **concurrently** with the in-flight call (biased select),
+for the same reason it does inside dmcp: the server is blocked until answered, so
+awaiting the call first would deadlock against the answer needed to finish it.
+
+**The question text belongs to the server, not to JARVIS.** Every
+`NEEDS_ACTION` payload carries the asking server's id and `untrusted: true`, and
+the `respond` tool description says so — a community server can phish through
+this channel, so it is never rendered as the assistant asking, and a
+credential-shaped prompt is declined here and left to a human. dispatch only
+carries the answer; whether an LLM may give one at all is the daemon's call under
+`CONFIRMATION_MODE`.
+
+Every breakdown resolves to a **decline** rather than a hang — a vanished task, a
+dropped channel, an unparsable line — because a decline is a real protocol
+outcome the server already handles, while silence parks the session forever.
 
 ## Build & Test
 
@@ -104,5 +143,7 @@ RUST_LOG=dispatch=debug dispatch serve  # With debug logging
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-30:* mid-execution interaction (Project-JARVIS#210, dispatch half). `SignalKind::NeedsAction` (wire name pinned to `NEEDS_ACTION`, since `rename_all = "UPPERCASE"` would emit `NEEDSACTION` and diverge from `Display`) and `TaskState::Waiting`, which `Task::is_running` counts so a parked task keeps its slot and its session. `DmcpClient::call_tool_interactive` drives `dmcp call --session --interactive` and parses its tagged JSON stream; the orchestrator pumps prompts concurrently with the call (biased select), registers the answer channel in `pending_answers`, and emits a `NEEDS_ACTION` signal attributing the question to the asking server with `untrusted: true`. New `respond` MCP tool (accept/decline/cancel) resumes the task; a stale or duplicate answer is a reported error, not a panic, and a question for a task that has gone is declined so the server unblocks. 41 tests pass.
 
 *2026-07-22:* MCP tools table extended to the full 13 tools; `nonce.rs` description corrected (output-provenance boundary nonces, not JSON-RPC); getrandom/libc/windows-sys added to the tech stack.

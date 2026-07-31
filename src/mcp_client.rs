@@ -1,6 +1,7 @@
 use crate::error::{DispatchError, Result};
 use std::process::Stdio;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 /// SIGKILLs a child's whole process group on drop, so aborting a task tears
@@ -474,6 +475,129 @@ impl DmcpClient {
             Err(_) => {
                 debug!(session = %sid, "no Tokio runtime; skipping session close spawn");
             }
+        }
+    }
+}
+
+/// A question a server asked mid-call, and where its answer goes.
+pub type PendingPrompt = (
+    serde_json::Value,
+    tokio::sync::oneshot::Sender<serde_json::Value>,
+);
+
+impl DmcpClient {
+    /// Call a tool with `dmcp call --session <sid> --interactive`, relaying any
+    /// question the server asks to `prompts` and feeding the answer back.
+    ///
+    /// Only a session task can take this path: elicitation needs the server to
+    /// stay alive across the exchange, which is exactly what a session is, and
+    /// dmcp itself refuses `--interactive` without `--session`.
+    ///
+    /// In this mode every dmcp stdout line is a tagged JSON object, so the
+    /// stream is parsed rather than trimmed. A line that cannot be parsed, or a
+    /// prompt nobody answers, resolves to a decline: the server unblocks and the
+    /// call ends instead of the task parking forever on a question no one sees.
+    pub async fn call_tool_interactive(
+        server: &str,
+        tool: &str,
+        params: &serde_json::Value,
+        session: &str,
+        prompts: mpsc::Sender<PendingPrompt>,
+    ) -> Result<String> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        debug!(server, tool, session, "calling dmcp tool (interactive)");
+        let mut args = Self::call_args(server, tool, params, Some(session));
+        args.push("--interactive".to_string());
+
+        let mut cmd = Command::new(Self::dmcp_bin());
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let mut child = cmd.spawn().map_err(|e| {
+            warn!(server, tool, error = %e, "failed to spawn dmcp");
+            DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e))
+        })?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| DispatchError::DmcpError("dmcp stdin unavailable".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DispatchError::DmcpError("dmcp stdout unavailable".to_string()))?;
+        let mut lines = BufReader::new(stdout).lines();
+
+        let mut result: Option<Result<String>> = None;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let msg: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match msg.get("type").and_then(|t| t.as_str()) {
+                Some("prompt") => {
+                    let answer = Self::ask(&prompts, msg).await;
+                    if stdin
+                        .write_all(format!("{}\n", answer).as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let _ = stdin.flush().await;
+                }
+                Some("result") => {
+                    let content = msg
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    result = Some(
+                        if msg.get("isError").and_then(|e| e.as_bool()) == Some(true) {
+                            Err(DispatchError::DmcpError(content))
+                        } else {
+                            Ok(content)
+                        },
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // Close stdin so dmcp is never left waiting on a line that is not coming.
+        drop(stdin);
+        let status = child.wait().await.ok();
+
+        result.unwrap_or_else(|| {
+            let code = status.and_then(|s| s.code()).unwrap_or(-1);
+            Err(DispatchError::DmcpError(format!(
+                "dmcp ended without a result (exit {})",
+                code
+            )))
+        })
+    }
+
+    /// Put one prompt to the orchestrator and wait for the answer. Any failure
+    /// of that channel is a decline, never a hang.
+    async fn ask(prompts: &mpsc::Sender<PendingPrompt>, prompt: serde_json::Value) -> String {
+        let decline = serde_json::json!({"action": "decline"}).to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if prompts.send((prompt, tx)).await.is_err() {
+            return decline;
+        }
+        match rx.await {
+            Ok(answer) => answer.to_string(),
+            Err(_) => decline,
         }
     }
 }

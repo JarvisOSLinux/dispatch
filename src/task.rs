@@ -6,6 +6,10 @@ use tokio::time::Instant;
 #[serde(rename_all = "lowercase")]
 pub enum TaskState {
     Running,
+    /// Parked on a question its server asked mid-call. The process is alive and
+    /// blocked; answering resumes it, so this is a phase of running, not an end
+    /// state — nothing here is reaped or reported as complete.
+    Waiting,
     Exited,
     Killed,
 }
@@ -93,8 +97,26 @@ impl Task {
         }
     }
 
+    /// Alive and not yet finished. A parked task counts: its process is up and
+    /// it will resume the moment its question is answered, so treating it as
+    /// finished would settle a session whose work is still outstanding.
     pub fn is_running(&self) -> bool {
-        self.state == TaskState::Running
+        matches!(self.state, TaskState::Running | TaskState::Waiting)
+    }
+
+    /// Park this task on a question; answering returns it to `Running`.
+    pub fn mark_waiting(&mut self) {
+        if self.state == TaskState::Running {
+            self.state = TaskState::Waiting;
+        }
+    }
+
+    /// Resume after an answer. Only a parked task moves, so a late answer
+    /// cannot resurrect one that already exited or was killed.
+    pub fn mark_resumed(&mut self) {
+        if self.state == TaskState::Waiting {
+            self.state = TaskState::Running;
+        }
     }
 
     pub fn mark_exited(&mut self) {

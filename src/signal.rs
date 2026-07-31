@@ -12,6 +12,15 @@ pub enum SignalKind {
     Remind,
     Wait,
     Kill,
+    /// A running task cannot continue until someone answers a question its
+    /// server asked. Unlike EXIT this is not terminal: the task is alive and
+    /// holding its process, waiting for `respond`.
+    ///
+    /// Renamed explicitly: `rename_all = "UPPERCASE"` would emit `NEEDSACTION`
+    /// while `Display` prints `NEEDS_ACTION`, so a consumer matching the JSON
+    /// against the text form would silently never match.
+    #[serde(rename = "NEEDS_ACTION")]
+    NeedsAction,
 }
 
 impl fmt::Display for SignalKind {
@@ -22,6 +31,7 @@ impl fmt::Display for SignalKind {
             SignalKind::Remind => write!(f, "REMIND"),
             SignalKind::Wait => write!(f, "WAIT"),
             SignalKind::Kill => write!(f, "KILL"),
+            SignalKind::NeedsAction => write!(f, "NEEDS_ACTION"),
         }
     }
 }
