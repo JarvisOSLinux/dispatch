@@ -334,6 +334,62 @@ fn exit_failure_detail_still_prefers_stdout_then_stderr() {
     );
 }
 
+/// Pipe fds currently open in a process, counted via /proc. The stderr reader
+/// holds its pipe's read end for exactly as long as it lives, so this is an
+/// outside-observable proxy for "the reader task ended".
+#[cfg(target_os = "linux")]
+fn pipe_fd_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read /proc fd dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            std::fs::read_link(e.path())
+                .map(|t| t.to_string_lossy().starts_with("pipe:"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// When a grandchild of the dmcp child inherits the stderr pipe and outlives
+/// it, the drain deadline must ABORT the reader, not just stop waiting for
+/// it: a dropped-but-live reader keeps the pipe fd (and the ring) alive for
+/// the daemon's lifetime, one leak per call to a daemonizing server.
+#[cfg(target_os = "linux")]
+#[test]
+fn drain_timeout_releases_the_stderr_pipe_fd() {
+    let mut s = Serve::start();
+    let baseline = pipe_fd_count(s.child.id());
+
+    s.call(
+        "dispatch",
+        json!({"tasks": [{"server": "fake", "tool": "daemonize"}]}),
+    );
+    let exit = s
+        .wait_signal(Duration::from_secs(10), |d| d["kind"] == "EXIT")
+        .expect("EXIT must be pushed once the drain deadline passes");
+    let e = exit["nonce"].as_str().unwrap();
+    assert_eq!(
+        exit["message"].as_str().unwrap(),
+        format!("[hash={e}] 200 <{e}>daemon-started</{e}>"),
+        "the lingering grandchild must not change the call's result"
+    );
+
+    // The abort lands asynchronously just before the EXIT is emitted; give
+    // the scheduler a moment to drop the cancelled reader.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let open = pipe_fd_count(s.child.id());
+        if open <= baseline {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stderr pipe fd leaked past the drain timeout: {open} open pipes vs baseline {baseline}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// (e): a quick success is untouched end to end — EXIT inlines stdout under
 /// the task nonce and get_output returns it verbatim.
 #[test]

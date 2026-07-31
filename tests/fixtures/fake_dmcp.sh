@@ -23,6 +23,14 @@ call)
         printf 'slow-result'
         exit 0
         ;;
+    daemonize)
+        # Grandchild inherits the stderr write end and outlives this process,
+        # so the pipe never reaches EOF; stdout is redirected away so the
+        # call's stdout EOF (and thus its result) is immediate.
+        sleep 20 >/dev/null &
+        printf 'daemon-started'
+        exit 0
+        ;;
     fail_with_stderr)
         printf 'failure detail on stderr\n' >&2
         exit 1
