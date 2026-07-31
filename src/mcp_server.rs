@@ -148,10 +148,15 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "status",
-            "description": "Get current state of all active tasks.",
+            "description": "Get current state of all active tasks. Pass 'tail': n to additionally get, per running task, the latest n characters of its live stderr (clamped to the retained 64 KiB), wrapped in a provenance boundary like EXIT output.",
             "inputSchema": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "tail": {
+                        "type": "integer",
+                        "description": "If set, each running task also carries 'tail' — the latest N characters of its live stderr as '[hash=h] <h>…</h>' — and 'tail_hash'. Omit for the plain status view."
+                    }
+                }
             }
         },
         {
@@ -513,7 +518,7 @@ async fn handle_tools_call(
         "dispatch" => handle_dispatch(id, arguments, orchestrator).await,
         "kill" => handle_kill(id, arguments, orchestrator).await,
         "wait" => handle_wait(id, arguments, orchestrator).await,
-        "status" => handle_status(id, orchestrator).await,
+        "status" => handle_status(id, arguments, orchestrator).await,
         "log" => handle_log(id, arguments, orchestrator).await,
         "get_output" => handle_get_output(id, arguments, orchestrator).await,
         "timer" => handle_timer(id, arguments, orchestrator).await,
@@ -668,11 +673,24 @@ async fn handle_wait(
     }
 }
 
-async fn handle_status(id: Value, orchestrator: Arc<Mutex<Orchestrator>>) -> JsonRpcResponse {
+async fn handle_status(
+    id: Value,
+    arguments: Value,
+    orchestrator: Arc<Mutex<Orchestrator>>,
+) -> JsonRpcResponse {
+    let tail = arguments
+        .get("tail")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+
     // No draining here: the serve loop's wake path (drain_emittable) is the sole
     // drainer so completions can be pushed. We report the current window (#26).
     let orch = orchestrator.lock().await;
-    let statuses = orch.status();
+    let statuses = match tail {
+        // Absent keeps the response byte-identical to the tail-less status.
+        None => orch.status(),
+        Some(n) => orch.status_with_tail(n),
+    };
     JsonRpcResponse::success(
         id,
         json!({

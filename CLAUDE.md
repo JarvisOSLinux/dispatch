@@ -45,6 +45,7 @@ src/
 ├── orchestrator.rs   Core event loop: task spawning, signal routing, reminders
 ├── task.rs           Task state machine (Init → Running → Exit/Killed)
 ├── signal.rs         Signal types + rolling signal window (last 20 entries)
+├── tail.rs           Bounded per-task live stderr ring (64 KiB) feeding REMIND/status tails
 ├── pid.rs            Internal PID assignment and tracking
 ├── reminder.rs       Timer-based reminder system
 ├── mcp_client.rs     Client for calling dmcp and MCP servers
@@ -60,7 +61,7 @@ src/
 | `dispatch` | Dispatch a list of tasks for concurrent execution (per-task `remind_after`/`fire_wake`/`defer_output`; top-level `strategy`/`session_id`) |
 | `kill` | Terminate running tasks by PID |
 | `wait` | Acknowledge reminder, keep task running |
-| `status` | Get current state of all active tasks |
+| `status` | Get current state of all active tasks (optional `tail`: latest N chars of each running task's live stderr, provenance-wrapped) |
 | `log` | Get signal window (last N entries, default 20) |
 | `get_output` | Retrieve full output from completed tasks (incl. `defer_output` tasks) |
 | `timer` | Set a one-shot timer that fires REMIND signal |
@@ -77,7 +78,7 @@ src/
 |--------|---------|
 | `INIT` | Task started |
 | `EXIT` | Task finished (success or failure) |
-| `REMIND` | Task running beyond timeout |
+| `REMIND` | Task running beyond timeout (MCP tasks: carries the latest 4096 chars of live stderr, provenance-wrapped) |
 | `WAIT` | LLM acknowledged reminder |
 | `KILL` | Task terminated |
 
@@ -104,5 +105,7 @@ RUST_LOG=dispatch=debug dispatch serve  # With debug logging
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-07-31:* live output for running tasks (#36). `tail.rs` added — a `TAIL_BUFFER_CAP` (64 KiB) byte ring per running MCP task, fed incrementally from the dmcp child's stderr by a reader spawned beside `wait_with_output` in `mcp_client::call_tool` (stdout stays the result wire, read at exit; both pipes still drain concurrently). REMIND now carries the newest `REMIND_TAIL_CHARS` (4096) characters of that ring, wrapped `[hash=h] <h>…</h>` exactly like EXIT output — the tail is the same tool-authored, untrusted class of data — but under a **fresh nonce per emission**: the task's EXIT nonce seals output the tool is still producing, and disclosing it mid-run would let a tool that learns it forge boundaries in bytes it has yet to write. `status {"tail": n}` returns the newest n characters per running task (`tail`/`tail_hash` fields, same treatment, clamped to the ring); without `tail` the status response is regression-tested byte-identical to before. Tail extraction counts characters over a lossy decode, cut on char boundaries — the ring drops oldest *bytes*, so a partial sequence at its front renders U+FFFD, and a cut never splits a multi-byte char. The ring is dropped when the task settles (EXIT/KILL) — EXIT already carries the real output. Failure detail still prefers stdout and falls back to stderr, now read from the ring (identical up to the cap). Verified end to end by driving the real `dispatch serve` over stdio JSON-RPC against a fake `dmcp` on PATH (`tests/fixtures/fake_dmcp.sh`) that writes stderr mid-run: the pushed REMIND notification itself carries the wrapped tail (a recorded-but-never-emitted signal fails these tests), status tail present while running / absent after, byte-identical no-tail status, EXIT/`get_output` unchanged on success and both failure-detail arms.
 
 *2026-07-22:* MCP tools table extended to the full 13 tools; `nonce.rs` description corrected (output-provenance boundary nonces, not JSON-RPC); getrandom/libc/windows-sys added to the tech stack.

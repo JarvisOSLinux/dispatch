@@ -85,7 +85,7 @@ Add to your MCP client config (Claude, Cursor, etc.):
 | `dispatch` | Dispatch tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?, fire_wake?, defer_output?}]`, `strategy?: string`, `session_id?: string` |
 | `kill` | Terminate running tasks by PID | `pids: [int]` |
 | `wait` | Acknowledge reminder, keep tasks running | `pids: [int]` |
-| `status` | Get current state of all active tasks | — |
+| `status` | Get current state of all active tasks; with `tail`, include each running task's live stderr tail | `tail?: int` |
 | `log` | Get the signal window (last N entries) | `count?: int` (default: 20) |
 | `get_output` | Retrieve full output of completed tasks (incl. `defer_output` tasks) | `pids: [int]` |
 | `timer` | Set a one-shot timer that fires a REMIND signal after a duration | `label: string`, `duration: int` (seconds), `metadata?: object` |
@@ -102,6 +102,12 @@ Per-task options: `fire_wake` (default `true` — set `false` to suppress per-ta
 
 Tool calls are fire-and-return: `dispatch`/`timer` enqueue INIT and return the current signal window plus PIDs immediately. EXIT/REMIND signals are pushed asynchronously as MCP logging notifications (`notifications/message`, logger `dispatch.signal`) — individually for `fire_wake: true` tasks, as one batch for a settled `fire_wake: false` group.
 
+### Live task output
+
+While an MCP task runs, dispatch tails the dmcp child's stderr into a bounded per-task ring buffer (64 KiB; oldest bytes dropped). A REMIND signal carries the newest 4096 characters of that buffer, and `status {"tail": n}` returns the newest `n` characters per running task (clamped to what the buffer holds). Stdout is untouched — it stays the result wire, delivered in the EXIT signal exactly as before.
+
+The tail is tool-authored output, i.e. untrusted input to the LLM, so it gets the same provenance boundary as EXIT output: `[hash=h] <h>…</h>`, with a fresh nonce for every emission. The buffer is dropped when the task settles (EXIT/KILL) — the EXIT signal already carries the task's real output.
+
 ## Signals
 
 Every event is a signal. The signal window (last 20 entries) is the LLM's working memory.
@@ -110,7 +116,7 @@ Every event is a signal. The signal window (last 20 entries) is the LLM's workin
 |--------|---------|-------------|
 | `INIT` | Task started | dispatch (on spawn) |
 | `EXIT` | Task finished (success or failure) | Task completion |
-| `REMIND` | Task/timer running beyond threshold | dispatch (timer or `remind_after`) |
+| `REMIND` | Task/timer running beyond threshold (MCP tasks: carries the latest stderr tail) | dispatch (timer or `remind_after`) |
 | `WAIT` | LLM acknowledged reminder, continuing | LLM response |
 | `KILL` | Task terminated | LLM response |
 

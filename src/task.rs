@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
+use crate::tail::TaskTail;
+
 /// Task state machine: Init → Running → Exit | Killed
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +68,11 @@ pub struct Task {
     pub started_at: Instant,
     /// Provenance nonce for MCP tasks; None for timers (no external output).
     pub nonce: Option<String>,
+    /// Live stderr ring while the task runs (MCP tasks only; timers have no
+    /// child process). Dropped when the task settles (EXIT/KILL): the EXIT
+    /// signal already carries the task's real output, so nothing legitimate
+    /// reads the tail afterwards.
+    pub tail: Option<TaskTail>,
     /// Handle to cancel the running task.
     pub abort_handle: Option<tokio::task::AbortHandle>,
 }
@@ -78,6 +85,7 @@ impl Task {
             state: TaskState::Running,
             started_at: Instant::now(),
             nonce: Some(crate::nonce::generate()),
+            tail: Some(TaskTail::new()),
             abort_handle: None,
         }
     }
@@ -89,6 +97,7 @@ impl Task {
             state: TaskState::Running,
             started_at: Instant::now(),
             nonce: None,
+            tail: None,
             abort_handle: None,
         }
     }
@@ -99,10 +108,12 @@ impl Task {
 
     pub fn mark_exited(&mut self) {
         self.state = TaskState::Exited;
+        self.tail = None;
     }
 
     pub fn mark_killed(&mut self) {
         self.state = TaskState::Killed;
+        self.tail = None;
     }
 
     /// Short description for signal messages.
@@ -146,6 +157,14 @@ pub struct TaskStatus {
     #[serde(flatten)]
     pub kind: TaskStatusKind,
     pub state: TaskState,
+    /// Live stderr tail (`status {"tail": n}`; running MCP tasks only),
+    /// wrapped `[hash=h] <h>…</h>` exactly like EXIT output. Skipped when
+    /// absent so the tail-less status response stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail: Option<String>,
+    /// Nonce wrapping `tail`, for JSON consumers (mirrors `SignalEntry.nonce`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +200,8 @@ impl From<&Task> for TaskStatus {
             pid: task.pid,
             kind,
             state: task.state.clone(),
+            tail: None,
+            tail_hash: None,
         }
     }
 }
