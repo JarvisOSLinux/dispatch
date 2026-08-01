@@ -6,4 +6,5 @@ pub mod orchestrator;
 pub mod pid;
 pub mod reminder;
 pub mod signal;
+pub mod tail;
 pub mod task;

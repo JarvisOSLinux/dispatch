@@ -1,7 +1,44 @@
 use crate::error::{DispatchError, Result};
+use crate::tail::TaskTail;
 use std::process::Stdio;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::time::Duration;
 use tracing::{debug, warn};
+
+/// Bound on draining stderr after the child has exited: a stderr fd inherited
+/// by a longer-lived grandchild would otherwise hold a finished call open
+/// waiting for an EOF that never comes.
+const STDERR_DRAIN_SECS: u64 = 2;
+
+/// Feed a child's stderr into the task's live ring as it arrives, in raw
+/// chunks — line-buffering would park a newline-less "Proceed? [Y/n] " prompt.
+/// stdout is untouched: it stays the result wire, read once at exit.
+async fn tail_stderr(mut stderr: tokio::process::ChildStderr, tail: TaskTail) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stderr.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => tail.append(&buf[..n]),
+        }
+    }
+}
+
+/// Join the stderr reader, bounded by STDERR_DRAIN_SECS. On timeout the
+/// reader is aborted, not merely abandoned: the pipe is being held open by a
+/// grandchild that outlived the dmcp child, so the read will never return,
+/// and a dropped-but-live reader would leak the task, its pipe fd, and its
+/// ring handle for the daemon's lifetime — one per call to a daemonizing
+/// server. Abort is safe here: the task is parked in an async read and owns
+/// nothing that needs graceful shutdown.
+async fn drain_stderr_reader(reader: &mut tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_secs(STDERR_DRAIN_SECS), &mut *reader)
+        .await
+        .is_err()
+    {
+        reader.abort();
+    }
+}
 
 /// SIGKILLs a child's whole process group on drop, so aborting a task tears
 /// down the entire dmcp → MCP-server tree rather than orphaning grandchildren.
@@ -160,11 +197,17 @@ impl DmcpClient {
     /// For a `--session` task the process-group kill only reaps the thin dmcp
     /// client — the broker-held server survives, so the session is torn down
     /// explicitly via `session_close` on settle/kill.
+    ///
+    /// When `stderr_tail` is given, the child's stderr is streamed into it as
+    /// it arrives so REMIND and `status {"tail": n}` can show live progress;
+    /// the stderr fallback in the failure detail then reads that ring instead
+    /// of a full at-exit capture (identical up to the ring's cap).
     pub async fn call_tool(
         server: &str,
         tool: &str,
         params: &serde_json::Value,
         session: Option<&str>,
+        stderr_tail: Option<TaskTail>,
     ) -> Result<String> {
         debug!(server, tool, "calling dmcp tool");
         let mut cmd = Command::new("dmcp");
@@ -178,7 +221,7 @@ impl DmcpClient {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             warn!(server, tool, error = %e, "failed to spawn dmcp");
             DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e))
         })?;
@@ -196,6 +239,17 @@ impl DmcpClient {
             JobKiller(job)
         };
 
+        // Taking stderr out of the child leaves wait_with_output draining
+        // stdout only; the spawned reader drains stderr concurrently, so the
+        // both-pipes-drained guarantee (neither can fill and wedge the child)
+        // is preserved.
+        let stderr_reader = stderr_tail.as_ref().and_then(|tail| {
+            child
+                .stderr
+                .take()
+                .map(|pipe| tokio::spawn(tail_stderr(pipe, tail.clone())))
+        });
+
         let output = child.wait_with_output().await.map_err(|e| {
             warn!(server, tool, error = %e, "failed to run dmcp");
             DispatchError::DmcpError(format!("failed to run dmcp: {}", e))
@@ -203,6 +257,13 @@ impl DmcpClient {
 
         #[cfg(any(unix, windows))]
         guard.disarm();
+
+        // A fast-failing child's last stderr bytes may still be in flight;
+        // join the reader (bounded and aborted on timeout, see
+        // drain_stderr_reader) so the failure detail below sees them.
+        if let Some(mut reader) = stderr_reader {
+            drain_stderr_reader(&mut reader).await;
+        }
 
         // Status is read from the exit code, never by sniffing a sentinel in the
         // output: dmcp exits 0 only when the tool succeeded, and non-zero on a
@@ -213,7 +274,10 @@ impl DmcpClient {
             Ok(stdout.trim().to_string())
         } else {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = match &stderr_tail {
+                Some(tail) => tail.snapshot(),
+                None => String::from_utf8_lossy(&output.stderr).to_string(),
+            };
             // The tool's own error detail is on stdout; prefer it, falling back
             // to stderr (used for RPC/spawn failures).
             let msg = if !stdout.trim().is_empty() {
@@ -542,5 +606,53 @@ mod tests {
             as_strs(&DmcpClient::session_close_args("goal-9")),
             vec!["session", "close", "goal-9"]
         );
+    }
+
+    // The grandchild scenario in miniature: the process holding the write end
+    // (sleep) outlives the drain deadline, so the read never returns and the
+    // reader must end by abort — cancellation is what releases its pipe fd
+    // and its ring handle. Paused time makes the deadline fire immediately.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn drain_aborts_a_reader_whose_pipe_never_closes() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let mut reader = tokio::spawn(tail_stderr(stderr, TaskTail::new()));
+
+        drain_stderr_reader(&mut reader).await;
+
+        let err = (&mut reader)
+            .await
+            .expect_err("a reader parked past the deadline must be aborted, not left running");
+        assert!(err.is_cancelled(), "expected cancellation, got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_joins_a_reader_that_reaches_eof() {
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'last words' >&2"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let tail = TaskTail::new();
+        let mut reader = tokio::spawn(tail_stderr(stderr, tail.clone()));
+
+        drain_stderr_reader(&mut reader).await;
+
+        assert!(
+            reader.is_finished(),
+            "EOF must end the reader before the deadline, without abort"
+        );
+        assert_eq!(tail.snapshot(), "last words");
+        let _ = child.wait().await;
     }
 }

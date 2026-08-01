@@ -12,6 +12,7 @@ use crate::mcp_client::DmcpClient;
 use crate::pid;
 use crate::reminder::{ReminderEvent, ReminderManager};
 use crate::signal::{SignalEntry, SignalKind, SignalWindow};
+use crate::tail::REMIND_TAIL_CHARS;
 use crate::task::{Task, TaskDef, TaskKind, TaskState, TaskStatus, TimerDef};
 
 const DEFAULT_WINDOW_SIZE: usize = 20;
@@ -171,11 +172,17 @@ impl Orchestrator {
             } else {
                 None
             };
+            let tail = task.tail.clone();
 
             let join_handle = tokio::spawn(async move {
-                let result =
-                    DmcpClient::call_tool(&server, &tool, &params, session_for_call.as_deref())
-                        .await;
+                let result = DmcpClient::call_tool(
+                    &server,
+                    &tool,
+                    &params,
+                    session_for_call.as_deref(),
+                    tail,
+                )
+                .await;
                 let output = match result {
                     Ok(stdout) => Ok(stdout),
                     Err(e) => Err(format!("Error: {}", e)),
@@ -317,6 +324,28 @@ impl Orchestrator {
         self.tasks.values().map(TaskStatus::from).collect()
     }
 
+    /// `status` plus, per running MCP task, the latest `n` characters of its
+    /// live stderr ring (clamped to what the ring holds), wrapped like EXIT
+    /// output under a fresh per-emission nonce (see `remind_entry` for why
+    /// fresh). Settled tasks carry nothing — their ring was dropped on settle.
+    pub fn status_with_tail(&self, n: usize) -> Vec<TaskStatus> {
+        self.tasks
+            .values()
+            .map(|task| {
+                let mut status = TaskStatus::from(task);
+                if let Some(tail) = task.tail.as_ref().filter(|_| task.is_running()) {
+                    let text = tail.tail_chars(n);
+                    if !text.is_empty() {
+                        let h = crate::nonce::generate();
+                        status.tail = Some(format!("[hash={h}] <{h}>{text}</{h}>"));
+                        status.tail_hash = Some(h);
+                    }
+                }
+                status
+            })
+            .collect()
+    }
+
     pub fn get_output(&self, pid: u64) -> Option<&str> {
         self.outputs.get(&pid).map(|s| s.as_str())
     }
@@ -378,6 +407,38 @@ impl Orchestrator {
         }
     }
 
+    /// REMIND for a running MCP task carries the newest stderr from its live
+    /// ring — the same untrusted, tool-authored class of data as EXIT output,
+    /// so it gets the same boundary wrapping, but under a FRESH nonce per
+    /// emission: the task nonce seals output the tool is still producing, and
+    /// disclosing it mid-run would let a tool that learns it forge boundaries
+    /// in bytes it has yet to write. No stderr yet (or a timer) keeps the
+    /// plain message.
+    fn remind_entry(&self, pid: u64, elapsed_secs: u64) -> SignalEntry {
+        let tail = self
+            .tasks
+            .get(&pid)
+            .and_then(|t| t.tail.as_ref())
+            .map(|t| t.tail_chars(REMIND_TAIL_CHARS))
+            .filter(|s| !s.is_empty());
+        match tail {
+            Some(text) => {
+                let h = crate::nonce::generate();
+                SignalEntry::new(
+                    pid,
+                    SignalKind::Remind,
+                    format!("Running for {elapsed_secs}s [hash={h}] <{h}>{text}</{h}>"),
+                )
+                .with_nonce(h)
+            }
+            None => SignalEntry::new(
+                pid,
+                SignalKind::Remind,
+                format!("Running for {elapsed_secs}s"),
+            ),
+        }
+    }
+
     pub async fn wait_for_event(&mut self) -> Result<String> {
         if !self.has_running_tasks() {
             debug!("wait_for_event: no running tasks, returning immediately");
@@ -399,16 +460,16 @@ impl Orchestrator {
                     }
                 }
                 Some(event) = self.reminder_rx.recv() => {
-                    if let Some(task) = self.tasks.get(&event.pid) {
-                        if task.is_running() {
-                            info!(pid = event.pid, elapsed = event.elapsed_secs, "reminder fired, waking LLM");
-                            self.signal_window.push(SignalEntry::new(
-                                event.pid,
-                                SignalKind::Remind,
-                                format!("Running for {}s", event.elapsed_secs),
-                            ));
-                            return Ok(self.format_wakeup_context(DEFAULT_WINDOW_SIZE));
-                        }
+                    let running = self
+                        .tasks
+                        .get(&event.pid)
+                        .map(|t| t.is_running())
+                        .unwrap_or(false);
+                    if running {
+                        info!(pid = event.pid, elapsed = event.elapsed_secs, "reminder fired, waking LLM");
+                        let entry = self.remind_entry(event.pid, event.elapsed_secs);
+                        self.signal_window.push(entry);
+                        return Ok(self.format_wakeup_context(DEFAULT_WINDOW_SIZE));
                     }
                 }
                 else => {
@@ -461,21 +522,20 @@ impl Orchestrator {
         }
 
         while let Ok(event) = self.reminder_rx.try_recv() {
-            if let Some(task) = self.tasks.get(&event.pid) {
-                if task.is_running() {
-                    info!(
-                        pid = event.pid,
-                        elapsed = event.elapsed_secs,
-                        "reminder fired, pushing to LLM"
-                    );
-                    let entry = SignalEntry::new(
-                        event.pid,
-                        SignalKind::Remind,
-                        format!("Running for {}s", event.elapsed_secs),
-                    );
-                    self.signal_window.push(entry.clone());
-                    emit.push(Emission::Single(entry));
-                }
+            let running = self
+                .tasks
+                .get(&event.pid)
+                .map(|t| t.is_running())
+                .unwrap_or(false);
+            if running {
+                info!(
+                    pid = event.pid,
+                    elapsed = event.elapsed_secs,
+                    "reminder fired, pushing to LLM"
+                );
+                let entry = self.remind_entry(event.pid, event.elapsed_secs);
+                self.signal_window.push(entry.clone());
+                emit.push(Emission::Single(entry));
             }
         }
 
@@ -1015,6 +1075,99 @@ mod tests {
         let pids_b = orch.session_pids("goal_b");
         assert!(pids_b.contains(&3));
         assert!(!pids_b.contains(&1));
+    }
+
+    // -- live stderr tail (REMIND / status {"tail": n}) ---------------------
+
+    #[test]
+    fn remind_entry_wraps_tail_with_fresh_nonce() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, None, true);
+        let task_nonce = orch.tasks.get(&1).unwrap().nonce.clone().unwrap();
+        orch.tasks
+            .get(&1)
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .append(b"progress line\n");
+
+        let a = orch.remind_entry(1, 5);
+        assert_eq!(a.kind, SignalKind::Remind);
+        let h = a.nonce.clone().expect("tailed REMIND carries a nonce");
+        assert_eq!(
+            a.message,
+            format!("Running for 5s [hash={h}] <{h}>progress line\n</{h}>")
+        );
+        assert_ne!(
+            h, task_nonce,
+            "the task's EXIT nonce must not be disclosed mid-run"
+        );
+
+        let b = orch.remind_entry(1, 10);
+        assert_ne!(b.nonce, a.nonce, "each emission gets a fresh nonce");
+    }
+
+    #[test]
+    fn remind_entry_without_stderr_is_the_plain_message() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, None, true);
+        let entry = orch.remind_entry(1, 5);
+        assert_eq!(entry.message, "Running for 5s");
+        assert!(entry.nonce.is_none());
+    }
+
+    #[test]
+    fn status_with_tail_clamps_and_wraps_running_tasks_only() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, None, true);
+        let tail = orch.tasks.get(&1).unwrap().tail.clone().unwrap();
+        tail.append("héllo wörld".as_bytes());
+
+        let st = orch.status_with_tail(5);
+        let h = st[0].tail_hash.as_deref().expect("running task has a hash");
+        assert_eq!(
+            st[0].tail.as_deref(),
+            Some(format!("[hash={h}] <{h}>wörld</{h}>").as_str()),
+            "latest n CHARACTERS, wrapped like EXIT output"
+        );
+
+        let all = orch.status_with_tail(10_000);
+        assert!(
+            all[0].tail.as_deref().unwrap().contains("héllo wörld"),
+            "n beyond the buffer clamps to everything held"
+        );
+
+        orch.tasks.get_mut(&1).unwrap().mark_exited();
+        assert!(
+            orch.tasks.get(&1).unwrap().tail.is_none(),
+            "settle must drop the ring"
+        );
+        let done = orch.status_with_tail(5);
+        assert!(done[0].tail.is_none() && done[0].tail_hash.is_none());
+    }
+
+    #[test]
+    fn plain_status_serialization_carries_no_tail_keys() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, None, true);
+        orch.tasks
+            .get(&1)
+            .unwrap()
+            .tail
+            .as_ref()
+            .unwrap()
+            .append(b"noise");
+        let v = serde_json::to_value(orch.status()).unwrap();
+        assert!(v[0].get("tail").is_none() && v[0].get("tail_hash").is_none());
+    }
+
+    #[test]
+    fn kill_drops_the_live_tail() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, None, true);
+        orch.kill(&[1]).expect("kill succeeds");
+        assert!(orch.tasks.get(&1).unwrap().tail.is_none());
     }
 
     // -- stateful session teardown (#36) -----------------------------------
