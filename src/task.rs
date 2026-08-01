@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::tail::TaskTail;
+use crate::tool_meta::ToolMeta;
 
 /// Task state machine: Init → Running → Exit | Killed
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +24,11 @@ pub struct TaskDef {
     pub tool: String,
     #[serde(default)]
     pub params: serde_json::Value,
+    /// Seconds between reminders while this task runs. Three distinct values:
+    /// `Some(n>0)` is the caller's own interval, `Some(0)` is an explicit
+    /// opt-out ("no reminder, and I mean it"), and absent/`null` is *no
+    /// preference* — the only case in which a `blocking` tool's manifest may
+    /// supply one on the caller's behalf (#38).
     pub remind_after: Option<u64>,
     /// Wake the LLM when this task exits, even if other tasks are still running.
     /// Default: true. Set to false for fire-and-forget background tasks where
@@ -41,6 +47,30 @@ pub struct TaskDef {
     /// ignored and the task runs one-shot, exactly as before. Default: false.
     #[serde(default)]
     pub stateful: bool,
+}
+
+/// A task on its way into the orchestrator: the caller's definition plus what
+/// the tool's own manifest declares about it.
+///
+/// The two are kept apart rather than folded into `TaskDef` because they have
+/// different provenance — one is the LLM's request, the other is the server
+/// author's declaration — and because reading a manifest means spawning dmcp,
+/// which the synchronous fire-and-return `dispatch` path cannot do. The MCP
+/// layer resolves the metadata first and hands the pair in (#38).
+#[derive(Debug)]
+pub struct PreparedTask {
+    pub def: TaskDef,
+    pub tool_meta: Option<ToolMeta>,
+}
+
+impl PreparedTask {
+    /// A task with no manifest metadata: today's behavior exactly.
+    pub fn bare(def: TaskDef) -> Self {
+        Self {
+            def,
+            tool_meta: None,
+        }
+    }
 }
 
 /// A timer definition as received from the LLM.
@@ -73,6 +103,10 @@ pub struct Task {
     /// signal already carries the task's real output, so nothing legitimate
     /// reads the tail afterwards.
     pub tail: Option<TaskTail>,
+    /// Reminder interval dispatch armed on the caller's behalf because the
+    /// tool's manifest marks it blocking (`None` when the caller decided).
+    /// Surfaced by `status` so injected behavior is never silent.
+    pub auto_remind_after: Option<u64>,
     /// Handle to cancel the running task.
     pub abort_handle: Option<tokio::task::AbortHandle>,
 }
@@ -86,6 +120,7 @@ impl Task {
             started_at: Instant::now(),
             nonce: Some(crate::nonce::generate()),
             tail: Some(TaskTail::new()),
+            auto_remind_after: None,
             abort_handle: None,
         }
     }
@@ -98,6 +133,7 @@ impl Task {
             started_at: Instant::now(),
             nonce: None,
             tail: None,
+            auto_remind_after: None,
             abort_handle: None,
         }
     }
@@ -165,6 +201,12 @@ pub struct TaskStatus {
     /// Nonce wrapping `tail`, for JSON consumers (mirrors `SignalEntry.nonce`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_hash: Option<String>,
+    /// Reminder interval dispatch armed that the caller did not ask for (a
+    /// `blocking` tool's suggestion or the built-in default). Skipped when
+    /// absent, so a task whose reminder the caller chose — or has none — keeps
+    /// the pre-change status shape byte for byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_remind_after: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,6 +244,7 @@ impl From<&Task> for TaskStatus {
             state: task.state.clone(),
             tail: None,
             tail_hash: None,
+            auto_remind_after: task.auto_remind_after,
         }
     }
 }

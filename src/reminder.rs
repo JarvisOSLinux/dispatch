@@ -59,6 +59,12 @@ impl ReminderManager {
         self.timers.insert(pid, handle);
     }
 
+    /// Whether a reminder timer is currently running for a task.
+    #[cfg(test)]
+    pub fn is_armed(&self, pid: u64) -> bool {
+        self.timers.contains_key(&pid)
+    }
+
     /// Cancel the reminder timer for a task.
     pub fn cancel(&mut self, pid: u64) {
         if let Some(handle) = self.timers.remove(&pid) {
