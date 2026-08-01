@@ -9,164 +9,20 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+mod common;
+
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::json;
 
-static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A running `dispatch serve` with the fake dmcp first on its PATH. Reads the
-/// child's stdout on a thread into a channel so responses and asynchronously
-/// pushed notifications can both be awaited with timeouts.
-struct Serve {
-    child: Child,
-    stdin: ChildStdin,
-    rx: mpsc::Receiver<Value>,
-    stash: Vec<Value>,
-    next_id: u64,
-    root: PathBuf,
-}
-
-impl Serve {
-    fn start() -> Self {
-        let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root =
-            std::env::temp_dir().join(format!("dispatch-live-tail-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&root).expect("create test root");
-
-        let fake_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_dmcp.sh");
-        let fake_dst = root.join("dmcp");
-        std::fs::copy(&fake_src, &fake_dst).expect("install fake dmcp");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake_dst, std::fs::Permissions::from_mode(0o755))
-            .expect("make fake dmcp executable");
-
-        let path = format!(
-            "{}:{}",
-            root.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let mut child = Command::new(env!("CARGO_BIN_EXE_dispatch"))
-            .arg("serve")
-            .env("PATH", path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn dispatch serve");
-
-        let stdin = child.stdin.take().expect("child stdin");
-        let stdout = child.stdout.take().expect("child stdout");
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if tx.send(v).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let mut serve = Serve {
-            child,
-            stdin,
-            rx,
-            stash: Vec::new(),
-            next_id: 0,
-            root,
-        };
-        let init = serve.request("initialize", json!({}));
-        assert!(init.get("result").is_some(), "initialize failed: {init}");
-        serve.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-        serve
-    }
-
-    fn send(&mut self, v: &Value) {
-        writeln!(self.stdin, "{v}").expect("write to dispatch stdin");
-        self.stdin.flush().expect("flush dispatch stdin");
-    }
-
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
-        self.wait_for(Duration::from_secs(30), |v| {
-            v.get("id").and_then(Value::as_u64) == Some(id)
-        })
-        .unwrap_or_else(|| panic!("no response to {method} (id {id})"))
-    }
-
-    /// tools/call that must succeed; returns the `result` object.
-    fn call(&mut self, tool: &str, args: Value) -> Value {
-        let resp = self.request("tools/call", json!({"name": tool, "arguments": args}));
-        resp.get("result")
-            .cloned()
-            .unwrap_or_else(|| panic!("tool {tool} errored: {resp}"))
-    }
-
-    /// Pull messages (stashing non-matches so nothing is lost) until `pred`
-    /// matches or the timeout passes.
-    fn wait_for(&mut self, timeout: Duration, pred: impl Fn(&Value) -> bool) -> Option<Value> {
-        if let Some(i) = self.stash.iter().position(&pred) {
-            return Some(self.stash.remove(i));
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            let left = deadline.checked_duration_since(Instant::now())?;
-            match self.rx.recv_timeout(left) {
-                Ok(v) if pred(&v) => return Some(v),
-                Ok(v) => self.stash.push(v),
-                Err(_) => return None,
-            }
-        }
-    }
-
-    /// Await a pushed `dispatch.signal` notification matching `pred`, returning
-    /// its `data` (the serialized SignalEntry).
-    fn wait_signal(&mut self, timeout: Duration, pred: impl Fn(&Value) -> bool) -> Option<Value> {
-        self.wait_for(timeout, |v| {
-            v.get("method").and_then(Value::as_str) == Some("notifications/message")
-                && v["params"]["logger"] == "dispatch.signal"
-                && pred(&v["params"]["data"])
-        })
-        .map(|v| v["params"]["data"].clone())
-    }
-}
-
-impl Drop for Serve {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
-/// Extract the text between `<h>` and `</h>` in a boundary-wrapped message.
-fn wrapped_text<'a>(message: &'a str, h: &str) -> &'a str {
-    let open = format!("<{h}>");
-    let close = format!("</{h}>");
-    let start = message.find(&open).expect("open boundary tag") + open.len();
-    let end = message.rfind(&close).expect("close boundary tag");
-    &message[start..end]
-}
+use common::{wrapped_text, Serve};
 
 /// (a) + (e): a REMIND pushed mid-run carries the stderr seen so far, wrapped
 /// in a provenance boundary under a nonce that is NOT the task's EXIT nonce;
 /// the EXIT that follows is byte-for-byte the pre-change shape, stdout only.
 #[test]
 fn remind_carries_live_stderr_tail_and_exit_is_unchanged() {
-    let mut s = Serve::start();
+    let mut s = Serve::start("live-tail");
     let res = s.call(
         "dispatch",
         json!({"tasks": [{"server": "fake", "tool": "slow_progress", "remind_after": 1}]}),
@@ -211,7 +67,7 @@ fn remind_carries_live_stderr_tail_and_exit_is_unchanged() {
 /// task completes the field is absent.
 #[test]
 fn status_tail_while_running_and_absent_after_exit() {
-    let mut s = Serve::start();
+    let mut s = Serve::start("live-tail");
     s.call(
         "dispatch",
         json!({"tasks": [{"server": "fake", "tool": "slow_progress"}]}),
@@ -259,7 +115,7 @@ fn status_tail_while_running_and_absent_after_exit() {
 /// even while a buffer with content exists for the running task.
 #[test]
 fn status_without_tail_is_byte_identical() {
-    let mut s = Serve::start();
+    let mut s = Serve::start("live-tail");
     s.call(
         "dispatch",
         json!({"tasks": [{"server": "fake", "tool": "slow_progress"}]}),
@@ -299,7 +155,7 @@ fn status_without_tail_is_byte_identical() {
 /// when stdout is empty, and stdout is preferred when both exist.
 #[test]
 fn exit_failure_detail_still_prefers_stdout_then_stderr() {
-    let mut s = Serve::start();
+    let mut s = Serve::start("live-tail");
     s.call(
         "dispatch",
         json!({"tasks": [{"server": "fake", "tool": "fail_with_stderr"}]}),
@@ -357,7 +213,7 @@ fn pipe_fd_count(pid: u32) -> usize {
 #[cfg(target_os = "linux")]
 #[test]
 fn drain_timeout_releases_the_stderr_pipe_fd() {
-    let mut s = Serve::start();
+    let mut s = Serve::start("live-tail");
     let baseline = pipe_fd_count(s.child.id());
 
     s.call(
@@ -394,7 +250,7 @@ fn drain_timeout_releases_the_stderr_pipe_fd() {
 /// the task nonce and get_output returns it verbatim.
 #[test]
 fn quick_exit_output_is_unchanged() {
-    let mut s = Serve::start();
+    let mut s = Serve::start("live-tail");
     s.call(
         "dispatch",
         json!({"tasks": [{"server": "fake", "tool": "quick"}]}),

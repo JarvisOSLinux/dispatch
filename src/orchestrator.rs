@@ -13,7 +13,8 @@ use crate::pid;
 use crate::reminder::{ReminderEvent, ReminderManager};
 use crate::signal::{SignalEntry, SignalKind, SignalWindow};
 use crate::tail::REMIND_TAIL_CHARS;
-use crate::task::{Task, TaskDef, TaskKind, TaskState, TaskStatus, TimerDef};
+use crate::task::{PreparedTask, Task, TaskKind, TaskState, TaskStatus, TimerDef};
+use crate::tool_meta::plan_reminder;
 
 const DEFAULT_WINDOW_SIZE: usize = 20;
 const REMINDER_CHANNEL_SIZE: usize = 64;
@@ -117,9 +118,14 @@ impl Orchestrator {
     /// `strategy` replaces the current goal strategy if provided.
     /// `session_id` scopes the signal window for this batch — only PIDs
     /// belonging to this session appear in wakeup responses.
+    ///
+    /// Each task arrives paired with whatever its tool's manifest declares
+    /// (`PreparedTask`), which is what lets a `blocking` tool get a reminder the
+    /// caller never asked for (#38). Anything dispatch decides on the caller's
+    /// behalf is disclosed on the task's INIT signal and in `status`.
     pub fn dispatch(
         &mut self,
-        task_defs: Vec<TaskDef>,
+        tasks: Vec<PreparedTask>,
         strategy: Option<String>,
         session_id: Option<String>,
     ) -> Vec<u64> {
@@ -129,13 +135,14 @@ impl Orchestrator {
         if session_id.is_some() {
             self.current_session_id = session_id.clone();
         }
-        info!(count = task_defs.len(), "dispatching MCP tasks");
-        let mut pids = Vec::with_capacity(task_defs.len());
+        info!(count = tasks.len(), "dispatching MCP tasks");
+        let mut pids = Vec::with_capacity(tasks.len());
 
-        for def in task_defs {
+        for PreparedTask { def, tool_meta } in tasks {
             let task_pid = pid::next_pid();
-            let remind_after = def.remind_after;
+            let plan = plan_reminder(def.remind_after, tool_meta);
             let mut task = Task::new_mcp(task_pid, def);
+            task.auto_remind_after = plan.auto_applied();
             debug!(pid = task_pid, desc = %task.description(), "spawning MCP task");
 
             if let Some(ref sid) = session_id {
@@ -147,16 +154,25 @@ impl Orchestrator {
                 }
             }
 
-            self.signal_window.push(SignalEntry::new(
-                task_pid,
-                SignalKind::Init,
-                task.description(),
-            ));
+            // A reminder dispatch armed itself is announced in the INIT the
+            // caller reads back, because behavior injected silently is worse
+            // than none: the caller must be able to tell whose decision it was.
+            let init_message = match plan.applied_note() {
+                Some(note) => format!("{} {}", task.description(), note),
+                None => task.description(),
+            };
+            self.signal_window
+                .push(SignalEntry::new(task_pid, SignalKind::Init, init_message));
 
-            if let Some(secs) = remind_after {
-                if secs > 0 {
-                    self.reminder_mgr.start(task_pid, secs);
+            if let Some(secs) = plan.interval() {
+                if let Some(auto) = plan.auto_applied() {
+                    info!(
+                        pid = task_pid,
+                        secs = auto,
+                        "armed a reminder the caller did not request (tool declares blocking)"
+                    );
                 }
+                self.reminder_mgr.start(task_pid, secs);
             }
 
             let tx = self.task_result_tx.clone();
@@ -730,7 +746,8 @@ impl Drop for Orchestrator {
 mod tests {
     use super::*;
     use crate::signal::SignalKind;
-    use crate::task::TimerDef;
+    use crate::task::{TaskDef, TimerDef};
+    use crate::tool_meta::{ToolMeta, DEFAULT_BLOCKING_REMIND_SECS};
 
     fn timer_def(label: &str, duration: u64, metadata: Option<serde_json::Value>) -> TimerDef {
         TimerDef {
@@ -1168,6 +1185,129 @@ mod tests {
         insert_running_mcp(&mut orch, 1, None, true);
         orch.kill(&[1]).expect("kill succeeds");
         assert!(orch.tasks.get(&1).unwrap().tail.is_none());
+    }
+
+    // -- reminders for blocking tools (#38) ---------------------------------
+
+    /// One dispatchable task. The spawned dmcp call fails immediately in the
+    /// test environment (no dmcp on PATH), which is irrelevant here: everything
+    /// asserted below is enqueued synchronously by `dispatch`.
+    fn prepared(
+        tool: &str,
+        remind_after: Option<u64>,
+        tool_meta: Option<ToolMeta>,
+    ) -> PreparedTask {
+        PreparedTask {
+            def: TaskDef {
+                server: "srv".into(),
+                tool: tool.into(),
+                params: json!({}),
+                remind_after,
+                fire_wake: true,
+                defer_output: false,
+                stateful: false,
+            },
+            tool_meta,
+        }
+    }
+
+    fn blocking(suggested: Option<u64>) -> Option<ToolMeta> {
+        Some(ToolMeta {
+            blocking: true,
+            suggested_remind_after: suggested,
+        })
+    }
+
+    #[tokio::test]
+    async fn blocking_tool_without_remind_after_is_auto_armed_and_disclosed() {
+        let mut orch = Orchestrator::new();
+        let pids = orch.dispatch(
+            vec![prepared("run_job", None, blocking(Some(2)))],
+            None,
+            None,
+        );
+        let pid = pids[0];
+
+        let init = &orch.signal_window.all()[0];
+        assert_eq!(init.kind, SignalKind::Init);
+        assert!(
+            init.message.contains("auto-remind 2s"),
+            "an injected reminder must be announced on INIT, got: {}",
+            init.message
+        );
+        assert!(
+            orch.reminder_mgr.is_armed(pid),
+            "the reminder must be armed"
+        );
+
+        let status = serde_json::to_value(orch.status()).unwrap();
+        assert_eq!(status[0]["auto_remind_after"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn blocking_tool_without_a_suggestion_falls_back_to_the_builtin_default() {
+        let mut orch = Orchestrator::new();
+        orch.dispatch(vec![prepared("run_job", None, blocking(None))], None, None);
+        let status = serde_json::to_value(orch.status()).unwrap();
+        assert_eq!(
+            status[0]["auto_remind_after"],
+            json!(DEFAULT_BLOCKING_REMIND_SECS)
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_interval_wins_and_is_never_reported_as_auto() {
+        let mut orch = Orchestrator::new();
+        let pids = orch.dispatch(
+            vec![prepared("run_job", Some(9), blocking(Some(2)))],
+            None,
+            None,
+        );
+
+        assert_eq!(orch.signal_window.all()[0].message, "srv/run_job");
+        assert!(orch.reminder_mgr.is_armed(pids[0]));
+        let status = serde_json::to_value(orch.status()).unwrap();
+        assert!(status[0].get("auto_remind_after").is_none());
+    }
+
+    #[tokio::test]
+    async fn caller_zero_opts_out_even_for_a_blocking_tool() {
+        let mut orch = Orchestrator::new();
+        let pids = orch.dispatch(
+            vec![prepared("run_job", Some(0), blocking(Some(2)))],
+            None,
+            None,
+        );
+
+        assert_eq!(orch.signal_window.all()[0].message, "srv/run_job");
+        assert!(
+            !orch.reminder_mgr.is_armed(pids[0]),
+            "an explicit opt-out must leave no reminder armed"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_blocking_tool_without_remind_after_is_unchanged() {
+        let mut orch = Orchestrator::new();
+        let pids = orch.dispatch(
+            vec![
+                prepared("quick", None, Some(ToolMeta::default())),
+                prepared("also_quick", None, None),
+            ],
+            None,
+            None,
+        );
+
+        for (i, pid) in pids.iter().enumerate() {
+            assert!(
+                !orch.reminder_mgr.is_armed(*pid),
+                "no reminder may be armed"
+            );
+            assert!(!orch.signal_window.all()[i].message.contains("auto-remind"));
+        }
+        let status = serde_json::to_value(orch.status()).unwrap();
+        assert!(status[0].get("auto_remind_after").is_none());
+        assert!(status[1].get("auto_remind_after").is_none());
     }
 
     // -- stateful session teardown (#36) -----------------------------------

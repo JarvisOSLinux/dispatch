@@ -458,6 +458,39 @@ impl DmcpClient {
         }
     }
 
+    /// Argv (after the program name) for `dmcp info <id> --json`. Factored out
+    /// so the manifest read is assertable without spawning dmcp.
+    fn info_args(server: &str) -> Vec<String> {
+        vec!["info".to_string(), server.to_string(), "--json".to_string()]
+    }
+
+    /// Read an installed server's manifest via `dmcp info <id> --json`.
+    ///
+    /// This is dispatch's only source of what a server declares about its own
+    /// tools — `dmcp tools` asks the live server, which knows nothing of the
+    /// registry's `blocking` / `suggestedRemindAfter` keys. dmcp answers this
+    /// from the manifest already on disk, so it is a local read, not a registry
+    /// fetch. Errors (server not installed, dmcp absent, unparsable manifest)
+    /// are the caller's cue to proceed with no metadata at all.
+    pub async fn server_manifest(server: &str) -> Result<serde_json::Value> {
+        let output = Command::new("dmcp")
+            .args(Self::info_args(server))
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| DispatchError::DmcpError(format!("failed to spawn dmcp: {}", e)))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() {
+            serde_json::from_str(stdout.trim()).map_err(|e| {
+                DispatchError::DmcpError(format!("invalid JSON from dmcp info: {}", e))
+            })
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(DispatchError::DmcpError(stderr.trim().to_string()))
+        }
+    }
+
     /// List tools for a server via `dmcp tools <id> --json`.
     pub async fn list_tools(server: &str) -> Result<serde_json::Value> {
         let output = Command::new("dmcp")
@@ -597,6 +630,14 @@ mod tests {
         assert_eq!(
             as_strs(&args),
             vec!["call", "srv", "tool", "--session", "goal-1"]
+        );
+    }
+
+    #[test]
+    fn info_args_shape() {
+        assert_eq!(
+            as_strs(&DmcpClient::info_args("srv")),
+            vec!["info", "srv", "--json"]
         );
     }
 

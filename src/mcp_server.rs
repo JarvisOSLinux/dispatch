@@ -7,7 +7,8 @@ use tracing::{debug, info, warn};
 
 use crate::mcp_client::DmcpClient;
 use crate::orchestrator::{Emission, Orchestrator};
-use crate::task::{TaskDef, TimerDef};
+use crate::task::{PreparedTask, TaskDef, TimerDef};
+use crate::tool_meta::ToolMeta;
 
 // --- JSON-RPC types ---
 
@@ -86,7 +87,7 @@ fn tool_definitions() -> Value {
                                 "server": { "type": "string", "description": "MCP server ID (as known to dmcp)" },
                                 "tool": { "type": "string", "description": "Tool name on the server" },
                                 "params": { "type": "object", "description": "Parameters to pass to the tool" },
-                                "remind_after": { "type": "integer", "description": "Seconds before firing a reminder (omit for no reminder)" },
+                                "remind_after": { "type": "integer", "description": "Seconds between reminders while this task runs. Set 0 to opt out of reminders entirely. An explicit value always wins. Omit it to express no preference: a tool whose manifest marks it 'blocking' (it can park indefinitely awaiting input, so a task with no reminder would never wake you) then gets the interval its manifest suggests, or 30s if it suggests none — announced in that task's INIT signal and reported as 'auto_remind_after' by status. For every other tool, omitting still means no reminder." },
                                 "fire_wake": {
                                     "type": "boolean",
                                     "description": "Default: true. Set to false for fire-and-forget background tasks — suppresses per-task wakeup so the LLM is only woken when all fire_wake=false tasks complete together or a reminder fires."
@@ -154,7 +155,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "tail": {
                         "type": "integer",
-                        "description": "If set, each running task also carries 'tail' — the latest N characters of its live stderr as '[hash=h] <h>…</h>' — and 'tail_hash'. Omit for the plain status view."
+                        "description": "If set, each running task also carries 'tail' — the latest N characters of its live stderr as '[hash=h] <h>…</h>' — and 'tail_hash'. Omit for the plain status view. A task also carries 'auto_remind_after' when dispatch armed a reminder the caller did not ask for (a 'blocking' tool)."
                     }
                 }
             }
@@ -535,6 +536,69 @@ async fn handle_tools_call(
     }
 }
 
+/// Read the manifests of the given servers concurrently, keyed by server id.
+/// A server whose manifest cannot be read is simply absent from the map: no
+/// metadata means today's behavior, so a missing dmcp or an uninstalled server
+/// must never fail a dispatch.
+async fn fetch_manifests(servers: Vec<String>) -> std::collections::HashMap<String, Value> {
+    let reads: Vec<_> = servers
+        .into_iter()
+        .map(|server| {
+            tokio::spawn(async move {
+                match DmcpClient::server_manifest(&server).await {
+                    Ok(manifest) => Some((server, manifest)),
+                    Err(e) => {
+                        debug!(server = %server, error = %e, "no manifest for server; dispatching without tool metadata");
+                        None
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let mut manifests = std::collections::HashMap::new();
+    for read in reads {
+        if let Ok(Some((server, manifest))) = read.await {
+            manifests.insert(server, manifest);
+        }
+    }
+    manifests
+}
+
+/// Pair each task with what its tool's manifest declares (#38).
+///
+/// Only tasks that supplied no `remind_after` are looked up: an explicit
+/// interval — including the `0` opt-out — wins outright, so the manifest could
+/// not change the outcome and dispatch should not pay a subprocess for it. Each
+/// distinct server is read once, and all reads run concurrently, so a batch
+/// costs one manifest round trip rather than one per task.
+async fn prepare_tasks(defs: Vec<TaskDef>) -> Vec<PreparedTask> {
+    let mut wanted: Vec<String> = defs
+        .iter()
+        .filter(|d| d.remind_after.is_none())
+        .map(|d| d.server.clone())
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+
+    if wanted.is_empty() {
+        return defs.into_iter().map(PreparedTask::bare).collect();
+    }
+
+    let manifests = fetch_manifests(wanted).await;
+    defs.into_iter()
+        .map(|def| {
+            if def.remind_after.is_some() {
+                return PreparedTask::bare(def);
+            }
+            let tool_meta = manifests
+                .get(&def.server)
+                .and_then(|m| ToolMeta::from_manifest(m, &def.tool));
+            PreparedTask { def, tool_meta }
+        })
+        .collect()
+}
+
 async fn handle_dispatch(
     id: Value,
     arguments: Value,
@@ -566,6 +630,11 @@ async fn handle_dispatch(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Manifest reads happen BEFORE the lock is taken: they are local dmcp
+    // calls, but they are still awaits, and the orchestrator lock is never held
+    // across one.
+    let prepared = prepare_tasks(tasks).await;
+
     // Fire-and-return: dispatch synchronously enqueues INIT signals, then we
     // render the current window and return immediately. We do NOT block on
     // wait_for_event — the daemon captures INIT from this return and is woken
@@ -574,7 +643,7 @@ async fn handle_dispatch(
     // concurrent kill/status/log is instantly serviceable, and we must not
     // drain here — the serve loop's wake path drains and pushes completions.
     let mut orch = orchestrator.lock().await;
-    let pids = orch.dispatch(tasks, strategy, session_id);
+    let pids = orch.dispatch(prepared, strategy, session_id);
     let window = orch.wakeup_context();
     drop(orch);
 

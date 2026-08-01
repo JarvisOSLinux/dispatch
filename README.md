@@ -82,7 +82,7 @@ Add to your MCP client config (Claude, Cursor, etc.):
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `dispatch` | Dispatch tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?, fire_wake?, defer_output?}]`, `strategy?: string`, `session_id?: string` |
+| `dispatch` | Dispatch tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?, fire_wake?, defer_output?, stateful?}]`, `strategy?: string`, `session_id?: string` |
 | `kill` | Terminate running tasks by PID | `pids: [int]` |
 | `wait` | Acknowledge reminder, keep tasks running | `pids: [int]` |
 | `status` | Get current state of all active tasks; with `tail`, include each running task's live stderr tail | `tail?: int` |
@@ -96,7 +96,15 @@ Add to your MCP client config (Claude, Cursor, etc.):
 | `sync_index` | Sync the local vector index with installed servers | — |
 | `index_server` | Add/update one server in the vector index | `server_id`, `server vector` |
 
-Per-task options: `fire_wake` (default `true` — set `false` to suppress per-task wakeup; a `fire_wake: false` group is coalesced into one batch notification) and `defer_output` (default `false` — store output out-of-band, EXIT shows `200 (deferred)`, fetch with `get_output`). Top-level: `strategy` is persisted and prepended to every wakeup; `session_id` scopes the signal window to this session's PIDs.
+Per-task options: `fire_wake` (default `true` — set `false` to suppress per-task wakeup; a `fire_wake: false` group is coalesced into one batch notification), `defer_output` (default `false` — store output out-of-band, EXIT shows `200 (deferred)`, fetch with `get_output`) and `stateful` (default `false` — with a top-level `session_id`, run through a persistent dmcp session). Top-level: `strategy` is persisted and prepended to every wakeup; `session_id` scopes the signal window to this session's PIDs.
+
+### Reminders for blocking tools
+
+`remind_after` has three meanings: a positive number is the caller's own interval, `0` opts out of reminders entirely, and omitting it means *no preference*.
+
+Some tools can park indefinitely awaiting input — a shell job asking a question, an installer with no `-y`. A task on such a tool with no reminder produces no wake-up at all: the LLM goes idle believing work is in flight. A server manifest can therefore declare, per tool, `"blocking": true` and optionally `"suggestedRemindAfter": <seconds>`. When a dispatched task targets a blocking tool **and the caller expressed no preference**, dispatch arms the suggested interval, or `DEFAULT_BLOCKING_REMIND_SECS` (30s) if the manifest suggests none.
+
+An explicit `remind_after` always wins, opt-out included. And because a silently injected reminder is worse than none, dispatch says so: the task's INIT signal carries `[auto-remind Ns — tool declares blocking, ...]` and `status` reports `auto_remind_after: N` for that task. Tools that declare nothing are untouched — no manifest metadata means no reminder, exactly as before.
 
 ### Wakeups
 
@@ -116,7 +124,7 @@ Every event is a signal. The signal window (last 20 entries) is the LLM's workin
 |--------|---------|-------------|
 | `INIT` | Task started | dispatch (on spawn) |
 | `EXIT` | Task finished (success or failure) | Task completion |
-| `REMIND` | Task/timer running beyond threshold (MCP tasks: carries the latest stderr tail) | dispatch (timer or `remind_after`) |
+| `REMIND` | Task/timer running beyond threshold (MCP tasks: carries the latest stderr tail) | dispatch (timer, `remind_after`, or a blocking tool's auto-armed interval) |
 | `WAIT` | LLM acknowledged reminder, continuing | LLM response |
 | `KILL` | Task terminated | LLM response |
 

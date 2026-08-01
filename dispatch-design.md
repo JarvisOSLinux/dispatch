@@ -93,10 +93,12 @@ The LLM sends a structured task list to `dispatch` via MCP tool call:
 }
 ```
 
-Per-task options beyond `server`/`tool`/`params`/`remind_after`:
+Per-task options beyond `server`/`tool`/`params`:
 
+- **`remind_after`** — seconds between reminders. A positive number is the caller's own interval, `0` opts out of reminders entirely, and omitting the field means *no preference* — the only case in which a tool's manifest may supply an interval on the caller's behalf (see [Reminders](#5-reminders)).
 - **`fire_wake`** (default `true`) — when `false`, the task's EXIT does not wake the LLM by itself; EXITs from `fire_wake: false` tasks are coalesced into one batch notification once the batch completes.
 - **`defer_output`** (default `false`) — when `true`, the task's output is stored out-of-band and the EXIT shows `200 (deferred)`; retrieve it later with `get_output`.
+- **`stateful`** (default `false`) — when the dispatch call also carries a `session_id`, the task runs through a persistent dmcp session (`--session`) so one live server serves the whole goal; the session is torn down when the goal settles or its tasks are killed.
 
 Top-level options:
 
@@ -112,7 +114,7 @@ After dispatching, the LLM goes idle. It does not poll. It does not wait. It sle
 2. Spawns each task as a concurrent async operation via `tokio::spawn`
 3. Assigns each task a unique **PID**
 4. Pushes an `INIT` signal for each task into the signal queue
-5. Starts a reminder timer per task (if `remind_after` is set)
+5. Starts a reminder timer per task — the caller's `remind_after`, or the interval the tool's own manifest asks for when the caller expressed no preference (see [Reminders](#5-reminders))
 
 Tasks run independently. They share nothing except the signal channel. When a task finishes — success or failure — it pushes an `EXIT` signal with its output.
 
@@ -133,7 +135,7 @@ Every event in the system is a signal. Signals are structured log entries that f
 |--------|---------|-------------|
 | `INIT` | Task started | dispatch (on spawn) |
 | `EXIT` | Task finished (success or failure) | Task completion |
-| `REMIND` | Task has been running beyond its `remind_after` threshold | dispatch (timer) |
+| `REMIND` | Task has been running beyond its reminder interval; for an MCP task it carries the latest 4096 characters of the task's live stderr, provenance-wrapped under a fresh nonce | dispatch (timer) |
 | `WAIT` | LLM was reminded, decided to let task continue | LLM response |
 | `KILL` | Task terminated by LLM decision | LLM response |
 
@@ -172,7 +174,30 @@ Reminder intervals are set per-task by the LLM at dispatch time. The LLM chooses
 - Quick lookups: `"remind_after": 10`
 - Network operations: `"remind_after": 30`
 - Builds and heavy computation: `"remind_after": 120`
-- No reminder needed: omit the field
+- No reminder wanted: `"remind_after": 0`
+- No preference: omit the field
+
+#### Blocking tools
+
+Some tools park indefinitely awaiting input — a shell job that asks a question, an installer with no `-y`. Such a task produces no output, no exit, and (with no reminder) no signal at all: the LLM goes idle believing work is in flight, and nothing ever wakes it. The tool is the only party that knows this can happen, so it declares it. A server manifest may mark, **per tool**:
+
+```json
+{ "name": "run_job", "blocking": true, "suggestedRemindAfter": 30 }
+```
+
+Both keys are optional and opt-in; a tool that declares neither behaves exactly as it always has. `suggestedRemindAfter` without `blocking: true` is meaningless but is not an error — it is simply never read.
+
+dispatch reads the manifest through `dmcp info <server> --json` (a local read of the installed manifest, one per distinct server per dispatch call, and only for tasks that supplied no `remind_after` — for the rest it could not change the outcome). When a task targets a blocking tool **and the caller expressed no preference**, dispatch arms the tool's `suggestedRemindAfter`, or `DEFAULT_BLOCKING_REMIND_SECS` (30s) if the manifest suggests none.
+
+Precedence is absolute: an explicit `remind_after` always wins, including `0`. A caller that says "no reminder" gets none, even on a blocking tool.
+
+Behavior dispatch injects is never silent — a caller must be able to tell whose decision the reminder was:
+
+```
+[14:02:01] PID 1 INIT    shell/run_job [auto-remind 30s — tool declares blocking, interval suggested by its manifest]
+```
+
+and the task carries `auto_remind_after: 30` in `status`. A reminder the caller asked for is disclosed nowhere, because dispatch decided nothing. A manifest that cannot be read (server not installed, dmcp unreachable) yields no metadata, which is the pre-change behavior — a manifest read never fails a dispatch.
 
 ---
 
@@ -237,10 +262,10 @@ dispatch serve
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `dispatch` | Dispatch a list of tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?, fire_wake?, defer_output?}]`, `strategy?`, `session_id?` |
+| `dispatch` | Dispatch a list of tasks for concurrent execution | `tasks: [{server, tool, params, remind_after?, fire_wake?, defer_output?, stateful?}]`, `strategy?`, `session_id?` |
 | `kill` | Terminate running tasks by PID | `pids: [int]` |
 | `wait` | Acknowledge reminder, keep tasks running | `pids: [int]` |
-| `status` | Get current state of all active tasks | — |
+| `status` | Get current state of all active tasks; with `tail`, each running task also carries the latest N characters of its live stderr | `tail?: int` |
 | `log` | Get the signal window (last N entries) | `count?: int` (default: 20) |
 | `get_output` | Retrieve stored out-of-band output of deferred tasks | `pids: [int]` |
 | `timer` | Set a one-shot timer that fires a REMIND signal | `label`, `duration`, `metadata?` |
