@@ -8,27 +8,78 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every platform reports, so one broken leg does not hide the others.
+      # The release job still needs all four, so nothing ships half-built.
+      fail-fast: false
+      matrix:
+        # `asset` is a published contract: the jarvisos site and the ISO
+        # pipeline fetch these exact filenames. Rename one and they break.
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: dispatch
+            asset: dispatch-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: dispatch.exe
+            asset: dispatch-windows-x86_64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: dispatch
+            asset: dispatch-macos-aarch64
+          # macos-latest is arm64; plain Rust cross-compiles to the Intel
+          # target with no extra toolchain.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: dispatch
+            asset: dispatch-macos-x86_64
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - name: Install musl tools
+        if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install -y musl-tools
 
-      - name: Build static binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: cp target/x86_64-unknown-linux-musl/release/dispatch dispatch-linux-x86_64
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Collecting the binaries here rather than publishing from each matrix leg:
+  # four legs finishing at once would race to create the same release.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dispatch-linux-x86_64
+          files: dist/*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
