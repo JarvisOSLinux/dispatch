@@ -42,14 +42,13 @@ fn blocking_tool_without_remind_after_emits_an_auto_armed_remind() {
         "status must report the injected interval: {status}"
     );
 
+    // run_job prints its question at once, so the first-output reminder comes
+    // first; this test is about the periodic one at the manifest's interval.
     let remind = s
-        .wait_signal(Duration::from_secs(10), |d| d["kind"] == "REMIND")
-        .expect("a REMIND must be PUSHED to the client, not merely recorded");
-    let msg = remind["message"].as_str().unwrap();
-    assert!(
-        msg.starts_with("Running for 2s"),
-        "the reminder must fire at the manifest's suggested interval, got: {msg}"
-    );
+        .wait_signal(Duration::from_secs(10), |d| {
+            d["kind"] == "REMIND" && d["message"].as_str().unwrap().starts_with("Running for 2s")
+        })
+        .expect("a REMIND at the manifest's suggested interval must be PUSHED to the client");
     assert_eq!(remind["pid"], json!(1));
 }
 
@@ -74,13 +73,76 @@ fn explicit_remind_after_wins_over_the_manifest_suggestion() {
         "status must not claim dispatch chose the caller's interval: {status}"
     );
 
-    let remind = s
-        .wait_signal(Duration::from_secs(10), |d| d["kind"] == "REMIND")
+    let periodic = s
+        .wait_signal(Duration::from_secs(10), |d| {
+            d["kind"] == "REMIND" && !d["message"].as_str().unwrap().starts_with("Running for 0s")
+        })
         .expect("REMIND pushed");
-    let msg = remind["message"].as_str().unwrap();
+    let msg = periodic["message"].as_str().unwrap();
     assert!(
         msg.starts_with("Running for 1s"),
         "the caller's 1s must be used, not the manifest's 2s, got: {msg}"
+    );
+}
+
+/// A blocking tool's first output reaches the client at once, not at its
+/// interval: a sign-in prints its code and then waits for a person, and with a
+/// 300s interval nobody would see the code for five minutes.
+#[test]
+fn a_blocking_tools_first_output_is_reminded_at_once() {
+    let mut s = Serve::start("first-output");
+    s.call(
+        "dispatch",
+        json!({"tasks": [{"server": "signin", "tool": "login"}]}),
+    );
+
+    let early = s
+        .wait_signal(Duration::from_secs(3), |d| d["kind"] == "REMIND")
+        .expect("the first output must be pushed within seconds, not at 300s");
+    let msg = early["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with("Running for 0s") && msg.contains("WDJB-MJHT"),
+        "the early REMIND carries what the tool printed, got: {msg}"
+    );
+
+    s.wait_signal(Duration::from_secs(10), |d| d["kind"] == "EXIT")
+        .expect("the sign-in completes");
+    assert!(
+        s.wait_signal(Duration::from_millis(1), |d| d["kind"] == "REMIND")
+            .is_none(),
+        "only one early REMIND: the periodic interval is unchanged"
+    );
+}
+
+/// The early reminder is for tools that declare they block. A tool that
+/// declares nothing gets no extra wake-up for printing progress, even with a
+/// caller-chosen interval.
+#[test]
+fn first_output_of_a_non_blocking_tool_is_not_reminded() {
+    let mut s = Serve::start("first-output-plain");
+    s.call(
+        "dispatch",
+        json!({"tasks": [{"server": "fake", "tool": "slow_progress", "remind_after": 60}]}),
+    );
+    assert!(
+        s.wait_signal(Duration::from_millis(2500), |d| d["kind"] == "REMIND")
+            .is_none(),
+        "progress output on a non-blocking tool must not wake the caller"
+    );
+}
+
+/// An explicit opt-out covers the early reminder too.
+#[test]
+fn opting_out_also_skips_the_first_output_reminder() {
+    let mut s = Serve::start("first-output-optout");
+    s.call(
+        "dispatch",
+        json!({"tasks": [{"server": "signin", "tool": "login", "remind_after": 0}]}),
+    );
+    assert!(
+        s.wait_signal(Duration::from_millis(2500), |d| d["kind"] == "REMIND")
+            .is_none(),
+        "remind_after: 0 means no reminders at all"
     );
 }
 
