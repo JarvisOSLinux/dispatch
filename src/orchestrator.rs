@@ -13,6 +13,10 @@ use crate::pid;
 use crate::reminder::{ReminderEvent, ReminderManager};
 use crate::signal::{SignalEntry, SignalKind, SignalWindow};
 use crate::tail::REMIND_TAIL_CHARS;
+
+/// How long a blocking tool's first output is given to finish arriving before
+/// it is reminded about (see `ReminderManager::nudge_on_first_output`).
+const FIRST_OUTPUT_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 use crate::task::{PreparedTask, Task, TaskKind, TaskState, TaskStatus, TimerDef};
 use crate::tool_meta::plan_reminder;
 
@@ -140,6 +144,7 @@ impl Orchestrator {
 
         for PreparedTask { def, tool_meta } in tasks {
             let task_pid = pid::next_pid();
+            let blocking = tool_meta.is_some_and(|m| m.blocking);
             let plan = plan_reminder(def.remind_after, tool_meta);
             let mut task = Task::new_mcp(task_pid, def);
             task.auto_remind_after = plan.auto_applied();
@@ -173,6 +178,15 @@ impl Orchestrator {
                     );
                 }
                 self.reminder_mgr.start(task_pid, secs);
+                if blocking {
+                    if let Some(tail) = task.tail.clone() {
+                        self.reminder_mgr.nudge_on_first_output(
+                            task_pid,
+                            tail,
+                            FIRST_OUTPUT_SETTLE,
+                        );
+                    }
+                }
             }
 
             let tx = self.task_result_tx.clone();

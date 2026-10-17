@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tokio::sync::Notify;
+
 /// Bytes of live stderr retained per running task: 64 KiB. The buffer is a
 /// ring — past this bound the oldest bytes are dropped — because the tail
 /// answers "what is it doing right now", not "what has it done"; the EXIT
@@ -76,21 +78,43 @@ impl TailBuffer {
 /// when the task settles (EXIT/KILL) — the EXIT signal already carries the
 /// task's real output, so nothing legitimate reads the tail afterwards.
 #[derive(Clone, Debug)]
-pub struct TaskTail(Arc<Mutex<TailBuffer>>);
+pub struct TaskTail {
+    buffer: Arc<Mutex<TailBuffer>>,
+    /// Signalled once, by the first non-empty append (see `first_output`).
+    first: Arc<Notify>,
+}
 
 impl TaskTail {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(TailBuffer::new(TAIL_BUFFER_CAP))))
+        Self {
+            buffer: Arc::new(Mutex::new(TailBuffer::new(TAIL_BUFFER_CAP))),
+            first: Arc::new(Notify::new()),
+        }
     }
 
     // A poisoned lock only means a panic elsewhere mid-append; the retained
     // bytes are still sound to read, so never propagate the poison.
     fn lock(&self) -> MutexGuard<'_, TailBuffer> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn append(&self, chunk: &[u8]) {
-        self.lock().push_chunk(chunk);
+        let was_empty = {
+            let mut buffer = self.lock();
+            let was_empty = buffer.is_empty();
+            buffer.push_chunk(chunk);
+            was_empty
+        };
+        if was_empty && !chunk.is_empty() {
+            // notify_one keeps a permit when nobody waits yet, so a watcher
+            // that starts awaiting after the first write still wakes.
+            self.first.notify_one();
+        }
+    }
+
+    /// Resolves once the task has written anything.
+    pub async fn first_output(&self) {
+        self.first.notified().await;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -113,6 +137,33 @@ impl TaskTail {
 impl Default for TaskTail {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod first_output_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn first_output_resolves_even_if_written_before_awaiting() {
+        let tail = TaskTail::new();
+        tail.append(b"");
+        tail.append(b"code");
+        tokio::time::timeout(std::time::Duration::from_millis(100), tail.first_output())
+            .await
+            .expect("a write before the await still wakes it");
+    }
+
+    #[tokio::test]
+    async fn first_output_waits_for_a_write() {
+        let tail = TaskTail::new();
+        tail.append(b"");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), tail.first_output())
+                .await
+                .is_err(),
+            "an empty write is not output"
+        );
     }
 }
 

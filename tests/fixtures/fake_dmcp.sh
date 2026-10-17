@@ -23,6 +23,9 @@ info)
     blocking_no_suggestion)
         printf '{"id":"blocking_no_suggestion","tools":[{"name":"run_job","blocking":true}]}'
         ;;
+    signin)
+        printf '{"id":"signin","tools":[{"name":"login","blocking":true,"suggestedRemindAfter":300}]}'
+        ;;
     *)
         printf 'Server not found: %s\n' "$2" >&2
         exit 1
@@ -43,6 +46,14 @@ call)
         printf 'continue? [y/N] ' >&2
         sleep 6
         printf 'job-done'
+        exit 0
+        ;;
+    login)
+        # A sign-in: the code is printed at once, then the call waits for the
+        # person, far less long than its 300s reminder interval.
+        printf 'To sign in, open https://example.invalid/device and enter the code WDJB-MJHT\n' >&2
+        sleep 4
+        printf 'signed-in'
         exit 0
         ;;
     slow_progress)
