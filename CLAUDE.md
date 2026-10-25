@@ -63,7 +63,7 @@ src/
 | `kill` | Terminate running tasks by PID |
 | `wait` | Acknowledge reminder, keep task running |
 | `status` | Get current state of all active tasks (optional `tail`: latest N chars of each running task's live stderr, provenance-wrapped; `auto_remind_after` on any task whose reminder dispatch armed itself) |
-| `log` | Get signal window (last N entries, default 20) |
+| `log` | Get signal window (last N entries, default 20): text for reading, and `structuredContent.entries` as SignalEntry JSON, shaped like a pushed signal; an EXIT held for a `fire_wake=false` batch carries `held: true` |
 | `get_output` | Retrieve full output from completed tasks (incl. `defer_output` tasks) |
 | `timer` | Set a one-shot timer that fires REMIND signal |
 | `browse_servers` | Vector-search the MCP registry index |
@@ -106,6 +106,8 @@ RUST_LOG=dispatch=debug dispatch serve  # With debug logging
 - No comments explaining what code does; only non-obvious WHY
 
 ## Changelog — corrected claims
+
+*2026-10-25:* `log` returns the window as data the daemon can read. Its JSON was a top-level `entries` key beside `content`; that key is not part of the MCP tool-result schema, so the Python SDK dropped it and the daemon got only the text, which it could not parse: its poll fallback read nothing, a KILL (never pushed) never reached it, and a lost push was never caught up (Project-JARVIS#301 closed a killed task's block on the kill's own result instead). The entries are now in `structuredContent.entries`, each the same JSON a push carries, so the daemon's (pid, type, timestamp) dedup key agrees across push and poll. An EXIT held for a `fire_wake=false` batch is in the window before the batch is pushed; it carries `held: true` so a catch-up reader leaves it to the batch instead of delivering it alone (#28). `SignalWindow::to_json` had no other caller and is gone. Tests: `tests/signal_log.rs` drives `dispatch serve` and reads `structuredContent` as a client does: a pushed EXIT reads back identically, a KILL is in the log and never pushed, a held EXIT is marked until its batch is pushed; all three fail on the old code.
 
 *2026-10-16:* a blocking tool's first output is reminded at once. A sign-in tool prints its link and code the moment it has them, then waits for a person; with its manifest's 180s interval (mcp-registry#114) the model saw the code only three minutes later. `TaskTail` now signals its first non-empty append, and for a task on a `blocking` tool with any reminder (not an explicit `remind_after: 0`) `ReminderManager::nudge_on_first_output` waits for it, lets the rest of the line arrive (`FIRST_OUTPUT_SETTLE`, 500ms) and sends one ordinary reminder event, so the REMIND carries the tail like any other. Periodic reminders keep their interval, and `cancel`/`cancel_all` abort the watcher with the timer. A tool that declares nothing gets no extra wake-up. Tests: an early REMIND within seconds carrying the code, exactly one before EXIT, none for a non-blocking tool or after an opt-out; the two existing interval tests now wait for the periodic REMIND by its elapsed time.
 

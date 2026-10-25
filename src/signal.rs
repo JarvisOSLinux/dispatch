@@ -155,12 +155,6 @@ impl SignalWindow {
         out
     }
 
-    /// Serialize the window entries as JSON.
-    pub fn to_json(&self, count: usize) -> serde_json::Value {
-        let entries = self.last(count);
-        serde_json::to_value(entries).unwrap_or(serde_json::Value::Array(vec![]))
-    }
-
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -162,7 +162,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "log",
-            "description": "Get the signal window (last N entries).",
+            "description": "Get the signal window (last N entries). structuredContent.entries holds the same entries as JSON, shaped like a pushed signal (timestamp, pid, kind, message, and payload/nonce when set); an EXIT held for a fire_wake=false batch, not yet pushed, also carries held: true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -786,6 +786,8 @@ async fn handle_log(
     let window_text = orch.log_text(count);
     let window_json = orch.log_json(count);
 
+    // The entries go in structuredContent: a key outside the tool-result
+    // schema is dropped by MCP clients, so the daemon only ever got the text.
     JsonRpcResponse::success(
         id,
         json!({
@@ -793,7 +795,7 @@ async fn handle_log(
                 "type": "text",
                 "text": window_text
             }],
-            "entries": window_json
+            "structuredContent": {"entries": window_json}
         }),
     )
 }
