@@ -388,8 +388,27 @@ impl Orchestrator {
         self.signal_window.format_window(count)
     }
 
+    /// The window as SignalEntry JSON, the shape a pushed signal has, so a
+    /// reader catching up on pushes it missed keys them identically. An EXIT
+    /// held for a fire_wake=false batch is in the window before it is pushed;
+    /// it carries `"held": true` so that reader leaves it to the batch (#28).
     pub fn log_json(&self, count: usize) -> serde_json::Value {
-        self.signal_window.to_json(count)
+        let entries = self
+            .signal_window
+            .last(count)
+            .into_iter()
+            .map(|entry| {
+                let mut value = serde_json::to_value(entry).unwrap_or_default();
+                let held = self.held.values().flatten().any(|h| {
+                    h.pid == entry.pid && h.kind == entry.kind && h.timestamp == entry.timestamp
+                });
+                if held {
+                    value["held"] = json!(true);
+                }
+                value
+            })
+            .collect();
+        serde_json::Value::Array(entries)
     }
 
     pub fn has_running_tasks(&self) -> bool {
@@ -866,6 +885,39 @@ mod tests {
             }
             Emission::Single(_) => panic!("expected a merged Batch"),
         }
+    }
+
+    #[tokio::test]
+    async fn log_json_marks_an_exit_held_for_its_batch() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, Some("goalA"), false);
+        insert_running_mcp(&mut orch, 2, Some("goalA"), false);
+
+        complete_mcp(&orch, 1, "out1");
+        assert!(orch.drain_emittable().is_empty());
+        let window = orch.log_json(20);
+        let exit = window
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "EXIT" && e["pid"] == 1)
+            .expect("the held EXIT is in the window");
+        assert_eq!(exit["held"], true);
+
+        complete_mcp(&orch, 2, "out2");
+        assert_eq!(exit_pids(&orch.drain_emittable()), vec![1, 2]);
+        for entry in orch.log_json(20).as_array().unwrap() {
+            assert!(entry.get("held").is_none(), "batch pushed: {entry}");
+        }
+    }
+
+    #[tokio::test]
+    async fn log_json_entries_are_the_pushed_signals() {
+        let mut orch = Orchestrator::new();
+        insert_running_mcp(&mut orch, 1, None, true);
+        complete_mcp(&orch, 1, "out");
+        let pushed = flatten(&orch.drain_emittable());
+        assert_eq!(orch.log_json(20), serde_json::to_value(&pushed).unwrap());
     }
 
     #[tokio::test]
